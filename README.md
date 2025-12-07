@@ -31,10 +31,10 @@ Python starter for a risk-conscious Binance USDⓈ-M futures bot. It pulls marke
 
 ## What it does
 
-- Pulls recent klines and computes EMA cross with RSI, slow-EMA slope, and volatility filters to avoid chop.
+- Pulls recent klines and computes EMA cross with RSI (default 52/48), slow-EMA slope, and volatility/EMA-gap filters to avoid chop, plus a 200 EMA trend filter to stay with the dominant direction.
 - Uses $25 starting equity with 1% risk per trade; adapts to live wallet balance if higher.
-- Sizes quantity based on ATR stop distance and exchange lot/tick filters.
-- Sets leverage (default 5x), enters with a market order, and places a stop-market exit.
+- Sizes quantity based on ATR stop distance and exchange lot/tick filters; default stop at 2.5× ATR, take-profit at 2R, optional break-even and trailing-stop exits, and caps notional if you set `max_notional`.
+- Sets leverage (default 5x), enters with a market order, and places stop-market, break-even/TP-market, trailing-stop-market, and take-profit-market exits.
 - Prints a dry-run plan before sending anything live.
 
 ## Safety

@@ -1,7 +1,7 @@
 import argparse
 import os
 import webbrowser
-from typing import Tuple
+from typing import List, Tuple
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -21,7 +21,121 @@ def equity_curve(prices: pd.Series, signals: pd.Series, initial: float) -> pd.Se
     return equity
 
 
-def backtest(symbol: str, interval: str, lookback: int, initial: float) -> Tuple[pd.DataFrame, pd.Series]:
+def simulate_trades(df: pd.DataFrame, bot: FuturesBot, initial: float) -> Tuple[pd.Series, List[dict]]:
+    equity = initial
+    equity_curve = []
+    trades: List[dict] = []
+    position: dict | None = None
+    settings = bot.settings
+
+    for _, row in df.iterrows():
+        time = row["time"]
+        price = float(row["close"])
+        high = float(row["high"])
+        low = float(row["low"])
+        atr = float(row["atr"])
+        signal = int(row["signal"])
+
+        # manage open position first
+        if position:
+            direction = position["direction"]
+            stop = position["stop"]
+            tp = position["tp"]
+            entry = position["entry"]
+            stop_dist = position["stop_dist"]
+            peak = position["peak"]
+            trough = position["trough"]
+
+            # update peaks/troughs
+            if direction > 0:
+                peak = max(peak, high)
+            else:
+                trough = min(trough, low)
+
+            # activate break-even stop
+            if settings.break_even_rr > 0:
+                be_level = entry + direction * stop_dist * settings.break_even_rr
+                if (direction > 0 and high >= be_level) or (direction < 0 and low <= be_level):
+                    stop = max(stop, entry) if direction > 0 else min(stop, entry)
+
+            # activate/update trailing
+            trail_stop = None
+            if settings.trailing_start_rr > 0 and settings.trailing_callback_pct > 0:
+                activate = entry + direction * stop_dist * settings.trailing_start_rr
+                callback = settings.trailing_callback_pct / 100.0
+                if direction > 0 and high >= activate:
+                    trail_stop = peak * (1 - callback)
+                elif direction < 0 and low <= activate:
+                    trail_stop = trough * (1 + callback)
+
+            # check exits (conservative: stop/trail before TP if both touched same bar)
+            exit_reason = None
+            exit_price = None
+            if direction > 0:
+                if low <= stop:
+                    exit_price = stop
+                    exit_reason = "stop"
+                elif trail_stop is not None and low <= trail_stop:
+                    exit_price = trail_stop
+                    exit_reason = "trail"
+                elif high >= tp:
+                    exit_price = tp
+                    exit_reason = "tp"
+            else:
+                if high >= stop:
+                    exit_price = stop
+                    exit_reason = "stop"
+                elif trail_stop is not None and high >= trail_stop:
+                    exit_price = trail_stop
+                    exit_reason = "trail"
+                elif low <= tp:
+                    exit_price = tp
+                    exit_reason = "tp"
+
+            if exit_price is not None:
+                pnl = direction * (exit_price - entry) * position["qty"]
+                equity += pnl
+                trades.append(
+                    {
+                        "time": time,
+                        "dir": "LONG" if direction > 0 else "SHORT",
+                        "entry": entry,
+                        "exit": exit_price,
+                        "pnl": pnl,
+                        "reason": exit_reason,
+                    }
+                )
+                position = None
+            else:
+                position["peak"] = peak
+                position["trough"] = trough
+
+        # consider new entry only if flat
+        if not position and signal != 0:
+            try:
+                qty, stop_price, tp_price = bot._size_position(signal, price, atr, equity_override=equity)
+            except Exception:
+                equity_curve.append(equity)
+                continue
+            entry_price = price * (1 + settings.max_slippage_pct * signal)
+            stop_distance = abs(entry_price - stop_price)
+            position = {
+                "direction": signal,
+                "qty": qty,
+                "entry": entry_price,
+                "stop": stop_price,
+                "tp": tp_price,
+                "stop_dist": stop_distance,
+                "peak": high if signal > 0 else entry_price,
+                "trough": low if signal < 0 else entry_price,
+            }
+
+        equity_curve.append(equity)
+
+    return pd.Series(equity_curve, index=df.index), trades
+
+
+def backtest(symbol: str, interval: str, lookback: int, initial: float) -> Tuple[pd.DataFrame, pd.Series, List[dict]]:
     api_key = os.getenv("BINANCE_API_KEY", "")
     api_secret = os.getenv("BINANCE_API_SECRET", "")
     settings = Settings(symbol=symbol, interval=interval, lookback=lookback, live=False)
@@ -46,8 +160,8 @@ def backtest(symbol: str, interval: str, lookback: int, initial: float) -> Tuple
     df["short_entry"] = (df["signal"] == -1) & (df["signal_prev"] != -1)
     df["long_exit"] = (df["signal_prev"] == 1) & (df["signal"] != 1)
     df["short_exit"] = (df["signal_prev"] == -1) & (df["signal"] != -1)
-    eq = equity_curve(df["close"], df["signal"], initial)
-    return df, eq
+    eq, trades = simulate_trades(df, bot, initial)
+    return df, eq, trades
 
 
 def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_path: str, open_report: bool = True) -> None:
@@ -282,8 +396,12 @@ def main() -> None:
     parser.add_argument("--no-open", action="store_true", help="skip opening HTML automatically")
     args = parser.parse_args()
 
-    df, eq = backtest(args.symbol.upper(), args.interval, args.lookback, args.initial)
-    print(f"Final equity: ${eq.iloc[-1]:.2f}")
+    df, eq, trades = backtest(args.symbol.upper(), args.interval, args.lookback, args.initial)
+    print(f"Final equity: ${eq.iloc[-1]:.2f} ({(eq.iloc[-1]-args.initial)/args.initial*100:.2f}%)")
+    print(f"Trades: {len(trades)}")
+    if trades:
+        last = trades[-1]
+        print(f"Last trade: {last['dir']} entry {last['entry']:.6f} exit {last['exit']:.6f} reason={last['reason']} pnl={last['pnl']:.4f}")
     if args.html:
         plot_results_html(df, eq, args.symbol.upper(), args.html, open_report=not args.no_open)
         print(f"HTML report written to {args.html}")
