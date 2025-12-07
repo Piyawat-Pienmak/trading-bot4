@@ -1,0 +1,33 @@
+.env
+*.env
+.env.*
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+*.egg-info/
+.eggs/
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+
+# Generated outputs
+reports/
+backtest_report.html
+*.log
