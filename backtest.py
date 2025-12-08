@@ -318,6 +318,7 @@ def plot_results_html(
     theme: str = "dark",
     fast_ema: int = 9,
     slow_ema: int = 21,
+    event_log: List[dict] | None = None,
 ) -> None:
     if output_path:
         out_dir = os.path.dirname(output_path)
@@ -419,6 +420,10 @@ def plot_results_html(
     short_df = df[df["short_entry"]]
     long_exit_df = df[df["long_exit"]]
     short_exit_df = df[df["short_exit"]]
+    entry_stops = None
+    if event_log:
+        log_df = pd.DataFrame(event_log)
+        entry_stops = log_df[log_df["event"] == "entry"]
     if not long_df.empty:
         fig.add_trace(
             go.Scatter(
@@ -438,6 +443,47 @@ def plot_results_html(
             row=1,
             col=1,
         )
+    if entry_stops is not None and not entry_stops.empty:
+        long_stops = entry_stops[entry_stops["dir"] == "LONG"]
+        short_stops = entry_stops[entry_stops["dir"] == "SHORT"]
+        if not long_stops.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=long_stops["time"],
+                    y=long_stops["stop"],
+                    mode="markers",
+                    name="Long Stop",
+                    marker=dict(
+                        color="#ef4444",
+                        size=14,
+                        symbol="line-ew",
+                        line=dict(color="#ef4444", width=3),
+                    ),
+                    hovertemplate="Long Stop<br>%{x}<br>Stop: %{y:.6f}<extra></extra>",
+                    showlegend=True,
+                ),
+                row=1,
+                col=1,
+            )
+        if not short_stops.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=short_stops["time"],
+                    y=short_stops["stop"],
+                    mode="markers",
+                    name="Short Stop",
+                    marker=dict(
+                        color="#ef4444",
+                        size=14,
+                        symbol="line-ew",
+                        line=dict(color="#ef4444", width=3),
+                    ),
+                    hovertemplate="Short Stop<br>%{x}<br>Stop: %{y:.6f}<extra></extra>",
+                    showlegend=True,
+                ),
+                row=1,
+                col=1,
+            )
     if not short_df.empty:
         fig.add_trace(
             go.Scatter(
@@ -696,6 +742,7 @@ def main() -> None:
             theme=args.theme,
             fast_ema=settings.fast_ema,
             slow_ema=settings.slow_ema,
+            event_log=event_log,
         )
         print(f"HTML report written to {args.html}")
         if args.no_open:
