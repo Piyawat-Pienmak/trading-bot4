@@ -276,7 +276,9 @@ def simulate_trades(df: pd.DataFrame, bot: FuturesBot, initial: float) -> Tuple[
     return pd.Series(equity_curve, index=df.index), trades, event_log
 
 
-def backtest(symbol: str, interval: str, lookback: int, initial: float) -> Tuple[pd.DataFrame, pd.Series, List[dict], List[dict]]:
+def backtest(
+    symbol: str, interval: str, lookback: int, initial: float
+) -> Tuple[pd.DataFrame, pd.Series, List[dict], List[dict], Settings]:
     api_key = os.getenv("BINANCE_API_KEY", "")
     api_secret = os.getenv("BINANCE_API_SECRET", "")
     settings = Settings(symbol=symbol, interval=interval, lookback=lookback, live=False)
@@ -304,7 +306,7 @@ def backtest(symbol: str, interval: str, lookback: int, initial: float) -> Tuple
     df["long_exit"] = (df["signal_prev"] == 1) & (df["signal"] != 1)
     df["short_exit"] = (df["signal_prev"] == -1) & (df["signal"] != -1)
     eq, trades, event_log = simulate_trades(df, bot, initial)
-    return df, eq, trades, event_log
+    return df, eq, trades, event_log, settings
 
 
 def plot_results_html(
@@ -314,6 +316,8 @@ def plot_results_html(
     output_path: str,
     open_report: bool = True,
     theme: str = "dark",
+    fast_ema: int = 9,
+    slow_ema: int = 21,
 ) -> None:
     if output_path:
         out_dir = os.path.dirname(output_path)
@@ -343,7 +347,7 @@ def plot_results_html(
         shared_xaxes=True,
         vertical_spacing=0.05,
         subplot_titles=(
-            f"{symbol} price with EMA crossover",
+            f"{symbol} price with EMA {fast_ema}/{slow_ema} crossover",
             "RSI",
             "Equity",
         ),
@@ -370,7 +374,7 @@ def plot_results_html(
         go.Scatter(
             x=df["time"],
             y=df["ema_fast"],
-            name="EMA Fast",
+            name=f"EMA Fast ({fast_ema})",
             line=dict(color=ema_fast_color, width=1.2),
             hovertemplate="EMA Fast: %{y:.6f}<extra></extra>",
         ),
@@ -381,7 +385,7 @@ def plot_results_html(
         go.Scatter(
             x=df["time"],
             y=df["ema_slow"],
-            name="EMA Slow",
+            name=f"EMA Slow ({slow_ema})",
             line=dict(color=ema_slow_color, width=1.2),
             hovertemplate="EMA Slow: %{y:.6f}<extra></extra>",
         ),
@@ -661,7 +665,7 @@ def main() -> None:
     parser.add_argument("--log", default="reports/trade_log.csv", help="CSV path to export trade log")
     args = parser.parse_args()
 
-    df, eq, trades, event_log = backtest(args.symbol.upper(), args.interval, args.lookback, args.initial)
+    df, eq, trades, event_log, settings = backtest(args.symbol.upper(), args.interval, args.lookback, args.initial)
     final = eq.iloc[-1]
     print(f"Final equity: ${final:.2f} ({(final-args.initial)/args.initial*100:.2f}%)")
     print(f"Trades: {len(trades)}")
@@ -683,7 +687,16 @@ def main() -> None:
         print(f"Closed trades written to {closed_path}")
         print(f"Equity curve written to {equity_path}")
     if args.html:
-        plot_results_html(df, eq, args.symbol.upper(), args.html, open_report=not args.no_open, theme=args.theme)
+        plot_results_html(
+            df,
+            eq,
+            args.symbol.upper(),
+            args.html,
+            open_report=not args.no_open,
+            theme=args.theme,
+            fast_ema=settings.fast_ema,
+            slow_ema=settings.slow_ema,
+        )
         print(f"HTML report written to {args.html}")
         if args.no_open:
             print("Open the report in your browser to view the interactive crosshairs.")

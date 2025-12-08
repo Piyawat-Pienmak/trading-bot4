@@ -230,7 +230,7 @@ class FuturesBot:
         if bullish:
             if explain:
                 reason = (
-                    f"LONG: ema_fast {ema_fast:.6f}>ema_slow {ema_slow:.6f}, "
+                    f"LONG: ema_fast({self.settings.fast_ema}) {ema_fast:.6f}>ema_slow({self.settings.slow_ema}) {ema_slow:.6f}, "
                     f"price {price:.6f}>ema_trend {ema_trend:.6f}, slope {slope:.6f}>0, "
                     f"rsi {rsi:.2f}>={self.settings.rsi_long}, breakout={hh_break}, "
                     f"vol x{vol/vol_sma:.2f}>={self.settings.vol_min_mult}, "
@@ -242,7 +242,7 @@ class FuturesBot:
         if bearish:
             if explain:
                 reason = (
-                    f"SHORT: ema_fast {ema_fast:.6f}<ema_slow {ema_slow:.6f}, "
+                    f"SHORT: ema_fast({self.settings.fast_ema}) {ema_fast:.6f}<ema_slow({self.settings.slow_ema}) {ema_slow:.6f}, "
                     f"price {price:.6f}<ema_trend {ema_trend:.6f}, slope {slope:.6f}<0, "
                     f"rsi {rsi:.2f}<={self.settings.rsi_short}, breakout={ll_break}, "
                     f"vol x{vol/vol_sma:.2f}>={self.settings.vol_min_mult}, "
