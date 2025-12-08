@@ -21,12 +21,18 @@ class Settings:
     fast_ema: int = 9
     slow_ema: int = 21
     trend_ema: int = 200
-    slope_min_pct: float = 0.0002  # require minimum slope magnitude vs price
-    ema_gap_min_pct: float = 0.0002  # require min fast/slow separation vs price to avoid chop
+    slope_min_pct: float = 0.00025  # require minimum slope magnitude vs price
+    ema_gap_min_pct: float = 0.0001  # require min fast/slow separation vs price to avoid chop
+    htf_interval: str | None = "1h"  # higher timeframe for bias; None disables
+    htf_trend_ema: int = 200
+    breakout_lookback: int = 10  # bars for breakout filter
+    breakout_enabled: bool = True
+    vol_ma_period: int = 20
+    vol_min_mult: float = 1.1  # require volume above average to filter chop
     rsi_period: int = 14
-    rsi_long: float = 52.0
-    rsi_short: float = 48.0
-    atr_vol_min_pct: float = 0.004
+    rsi_long: float = 57.0
+    rsi_short: float = 43.0
+    atr_vol_min_pct: float = 0.003
     trend_lookback: int = 3
     atr_period: int = 14
     atr_multiplier: float = 2.5
@@ -34,6 +40,9 @@ class Settings:
     break_even_rr: float = 1.0
     trailing_start_rr: float = 1.5
     trailing_callback_pct: float = 0.4  # Binance min 0.1, max 5
+    partial_tp_enabled: bool = True
+    partial_tp_ratio: float = 0.5  # fraction to take off at first TP
+    partial_tp_rr: float = 1.0
     max_notional: float | None = None
     leverage: int = 5
     risk_pct: float = 0.01  # 1% of equity per trade
@@ -54,6 +63,7 @@ class FuturesBot:
             base_url = "https://fapi.binance.com"
         self.client = UMFutures(key=api_key, secret=api_secret, base_url=base_url)
         self.filters = self._fetch_filters(settings.symbol)
+        self.htf_trend: float | None = None
 
     def _fetch_filters(self, symbol: str) -> Dict[str, float]:
         info = self.client.exchange_info()
@@ -105,6 +115,19 @@ class FuturesBot:
         ].astype(float)
         return df
 
+    def _fetch_htf_trend(self) -> float | None:
+        if not self.settings.htf_interval:
+            return None
+        klines = self.client.klines(
+            symbol=self.settings.symbol,
+            interval=self.settings.htf_interval,
+            limit=self.settings.trend_ema + 5,
+        )
+        df = pd.DataFrame(klines, columns=["open_time", "open", "high", "low", "close", "volume", "close_time", "quote_asset_volume", "trades", "taker_base_vol", "taker_quote_vol", "ignore"])
+        df["close"] = df["close"].astype(float)
+        df["ema_htf"] = df["close"].ewm(span=self.settings.htf_trend_ema, adjust=False).mean()
+        return float(df["ema_htf"].iloc[-1])
+
     def _compute_rsi(self, series: pd.Series) -> pd.Series:
         delta = series.diff()
         gain = delta.where(delta > 0, 0.0).rolling(self.settings.rsi_period).mean()
@@ -118,6 +141,15 @@ class FuturesBot:
         df["ema_fast"] = df["close"].ewm(span=self.settings.fast_ema, adjust=False).mean()
         df["ema_slow"] = df["close"].ewm(span=self.settings.slow_ema, adjust=False).mean()
         df["ema_trend"] = df["close"].ewm(span=self.settings.trend_ema, adjust=False).mean()
+        if self.settings.breakout_enabled:
+            hh = df["close"].rolling(window=self.settings.breakout_lookback, min_periods=2).max().shift(1)
+            ll = df["close"].rolling(window=self.settings.breakout_lookback, min_periods=2).min().shift(1)
+            df["hh_break"] = df["close"] > hh
+            df["ll_break"] = df["close"] < ll
+        else:
+            df["hh_break"] = True
+            df["ll_break"] = True
+        df["vol_sma"] = df["volume"].rolling(window=self.settings.vol_ma_period, min_periods=5).mean()
         df["prev_close"] = df["close"].shift(1)
         df["high_low"] = df["high"] - df["low"]
         df["high_close"] = (df["high"] - df["prev_close"]).abs()
@@ -136,9 +168,15 @@ class FuturesBot:
         ema_fast = float(row["ema_fast"])
         ema_slow = float(row["ema_slow"])
         ema_trend = float(row["ema_trend"])
+        open_price = float(row["open"])
+        prev_close = float(row["prev_close"])
         rsi = float(row["rsi"])
         atr_pct = float(row["atr_pct"])
         slope = float(row["slow_slope"])
+        hh_break = bool(row.get("hh_break", False))
+        ll_break = bool(row.get("ll_break", False))
+        vol = float(row["volume"])
+        vol_sma = float(row.get("vol_sma", float("nan")))
         if (
             math.isnan(ema_fast)
             or math.isnan(ema_slow)
@@ -146,7 +184,11 @@ class FuturesBot:
             or math.isnan(rsi)
             or math.isnan(atr_pct)
             or math.isnan(slope)
+            or math.isnan(vol_sma)
+            or math.isnan(prev_close)
         ):
+            return 0
+        if vol < vol_sma * self.settings.vol_min_mult:
             return 0
         if atr_pct < self.settings.atr_vol_min_pct:
             return 0
@@ -160,6 +202,10 @@ class FuturesBot:
             and price > ema_trend
             and rsi >= self.settings.rsi_long
             and slope > 0
+            and hh_break
+            and (self.htf_trend is None or price > self.htf_trend)
+            and price > open_price
+            and price > prev_close
         )
         bearish = (
             ema_fast < ema_slow
@@ -167,6 +213,10 @@ class FuturesBot:
             and price < ema_trend
             and rsi <= self.settings.rsi_short
             and slope < 0
+            and ll_break
+            and (self.htf_trend is None or price < self.htf_trend)
+            and price < open_price
+            and price < prev_close
         )
         if bullish:
             return 1
@@ -287,6 +337,19 @@ class FuturesBot:
         print(f"[live] stop set id: {stop_order.get('orderId')}")
         effective_entry = float(order.get("avgPrice") or price)
         stop_distance = abs(effective_entry - stop_price)
+        # Optional partial take-profit at partial_tp_rr
+        if self.settings.partial_tp_enabled and 0 < self.settings.partial_tp_ratio < 1:
+            ptp_price = effective_entry + direction * stop_distance * self.settings.partial_tp_rr
+            ptp_order = self.client.new_order(
+                symbol=self.settings.symbol,
+                side=exit_side,
+                type="TAKE_PROFIT_MARKET",
+                stopPrice=str(ptp_price),
+                quantity=str(qty * self.settings.partial_tp_ratio),
+                reduceOnly="true",
+                workingType="MARK_PRICE",
+            )
+            print(f"[live] partial TP set id: {ptp_order.get('orderId')} qty={qty * self.settings.partial_tp_ratio} @ {ptp_price}")
         # Break-even exit using TP-MARKET so it triggers in profit direction
         if self.settings.break_even_rr > 0:
             be_price = effective_entry + direction * stop_distance * self.settings.break_even_rr
@@ -327,6 +390,8 @@ class FuturesBot:
         print(f"[live] take-profit set id: {tp_order.get('orderId')}")
 
     def run_once(self) -> None:
+        if self.settings.htf_interval:
+            self.htf_trend = self._fetch_htf_trend()
         klines = self.fetch_klines()
         with_indicators = self._compute_indicators(klines)
         direction, price, atr = self._latest_signal(with_indicators)

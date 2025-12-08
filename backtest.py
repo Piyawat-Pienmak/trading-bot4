@@ -45,6 +45,8 @@ def simulate_trades(df: pd.DataFrame, bot: FuturesBot, initial: float) -> Tuple[
             stop_dist = position["stop_dist"]
             peak = position["peak"]
             trough = position["trough"]
+            qty = position["qty"]
+            partial_taken = position.get("partial_taken", False)
 
             # update peaks/troughs
             if direction > 0:
@@ -71,6 +73,8 @@ def simulate_trades(df: pd.DataFrame, bot: FuturesBot, initial: float) -> Tuple[
             # check exits (conservative: stop/trail before TP if both touched same bar)
             exit_reason = None
             exit_price = None
+
+            # price ladder handling: stop/trail first, then partial TP, then final TP
             if direction > 0:
                 if low <= stop:
                     exit_price = stop
@@ -78,7 +82,21 @@ def simulate_trades(df: pd.DataFrame, bot: FuturesBot, initial: float) -> Tuple[
                 elif trail_stop is not None and low <= trail_stop:
                     exit_price = trail_stop
                     exit_reason = "trail"
-                elif high >= tp:
+                elif (
+                    settings.partial_tp_enabled
+                    and not partial_taken
+                    and settings.partial_tp_ratio > 0
+                    and settings.partial_tp_ratio < 1
+                ):
+                    ptp_price = entry + direction * stop_dist * settings.partial_tp_rr
+                    if high >= ptp_price:
+                        realized = direction * (ptp_price - entry) * qty * settings.partial_tp_ratio
+                        equity += realized
+                        qty *= 1 - settings.partial_tp_ratio
+                        partial_taken = True
+                        position["qty"] = qty
+                        position["partial_taken"] = True
+                if exit_price is None and high >= tp:
                     exit_price = tp
                     exit_reason = "tp"
             else:
@@ -88,12 +106,26 @@ def simulate_trades(df: pd.DataFrame, bot: FuturesBot, initial: float) -> Tuple[
                 elif trail_stop is not None and high >= trail_stop:
                     exit_price = trail_stop
                     exit_reason = "trail"
-                elif low <= tp:
+                elif (
+                    settings.partial_tp_enabled
+                    and not partial_taken
+                    and settings.partial_tp_ratio > 0
+                    and settings.partial_tp_ratio < 1
+                ):
+                    ptp_price = entry + direction * stop_dist * settings.partial_tp_rr
+                    if low <= ptp_price:
+                        realized = direction * (ptp_price - entry) * qty * settings.partial_tp_ratio
+                        equity += realized
+                        qty *= 1 - settings.partial_tp_ratio
+                        partial_taken = True
+                        position["qty"] = qty
+                        position["partial_taken"] = True
+                if exit_price is None and low <= tp:
                     exit_price = tp
                     exit_reason = "tp"
 
             if exit_price is not None:
-                pnl = direction * (exit_price - entry) * position["qty"]
+                pnl = direction * (exit_price - entry) * qty
                 equity += pnl
                 trades.append(
                     {
@@ -103,6 +135,7 @@ def simulate_trades(df: pd.DataFrame, bot: FuturesBot, initial: float) -> Tuple[
                         "exit": exit_price,
                         "pnl": pnl,
                         "reason": exit_reason,
+                        "equity_after": equity,
                     }
                 )
                 position = None
@@ -140,6 +173,8 @@ def backtest(symbol: str, interval: str, lookback: int, initial: float) -> Tuple
     api_secret = os.getenv("BINANCE_API_SECRET", "")
     settings = Settings(symbol=symbol, interval=interval, lookback=lookback, live=False)
     bot = FuturesBot(settings=settings, api_key=api_key, api_secret=api_secret)
+    if settings.htf_interval:
+        bot.htf_trend = bot._fetch_htf_trend()
     df = bot.fetch_klines()
     df = bot._compute_indicators(df)
     df["time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_convert(
@@ -394,14 +429,26 @@ def main() -> None:
     parser.add_argument("--initial", type=float, default=25.0, help="starting equity")
     parser.add_argument("--html", default="reports/backtest_report.html", help="output HTML report path (set empty to skip)")
     parser.add_argument("--no-open", action="store_true", help="skip opening HTML automatically")
+    parser.add_argument("--log", default="reports/trade_log.csv", help="CSV path to export trade log")
     args = parser.parse_args()
 
     df, eq, trades = backtest(args.symbol.upper(), args.interval, args.lookback, args.initial)
-    print(f"Final equity: ${eq.iloc[-1]:.2f} ({(eq.iloc[-1]-args.initial)/args.initial*100:.2f}%)")
+    final = eq.iloc[-1]
+    print(f"Final equity: ${final:.2f} ({(final-args.initial)/args.initial*100:.2f}%)")
     print(f"Trades: {len(trades)}")
-    if trades:
-        last = trades[-1]
-        print(f"Last trade: {last['dir']} entry {last['entry']:.6f} exit {last['exit']:.6f} reason={last['reason']} pnl={last['pnl']:.4f}")
+    wins = sum(1 for t in trades if t["pnl"] > 0)
+    losses = sum(1 for t in trades if t["pnl"] < 0)
+    win_rate = (wins / len(trades) * 100) if trades else 0.0
+    print(f"Wins: {wins}, Losses: {losses}, Win rate: {win_rate:.2f}%")
+    # export logs instead of printing all trades
+    if args.log:
+        os.makedirs(os.path.dirname(args.log), exist_ok=True)
+        trades_df = pd.DataFrame(trades)
+        trades_df.to_csv(args.log, index=False)
+        equity_path = args.log.replace(".csv", "_equity.csv")
+        eq.to_csv(equity_path, header=["equity"])
+        print(f"Trade log written to {args.log}")
+        print(f"Equity curve written to {equity_path}")
     if args.html:
         plot_results_html(df, eq, args.symbol.upper(), args.html, open_report=not args.no_open)
         print(f"HTML report written to {args.html}")
