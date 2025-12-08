@@ -21,10 +21,11 @@ def equity_curve(prices: pd.Series, signals: pd.Series, initial: float) -> pd.Se
     return equity
 
 
-def simulate_trades(df: pd.DataFrame, bot: FuturesBot, initial: float) -> Tuple[pd.Series, List[dict]]:
+def simulate_trades(df: pd.DataFrame, bot: FuturesBot, initial: float) -> Tuple[pd.Series, List[dict], List[dict]]:
     equity = initial
     equity_curve = []
     trades: List[dict] = []
+    event_log: List[dict] = []
     position: dict | None = None
     settings = bot.settings
 
@@ -127,6 +128,12 @@ def simulate_trades(df: pd.DataFrame, bot: FuturesBot, initial: float) -> Tuple[
             if exit_price is not None:
                 pnl = direction * (exit_price - entry) * qty
                 equity += pnl
+                exit_detail = {
+                    "stop": "Stop-loss hit",
+                    "trail": "Trailing stop activated",
+                    "tp": "Take-profit hit",
+                }.get(exit_reason or "", exit_reason or "")
+                exit_text = f"{exit_detail} @ {exit_price:.6f}".strip()
                 trades.append(
                     {
                         "time": time,
@@ -135,16 +142,64 @@ def simulate_trades(df: pd.DataFrame, bot: FuturesBot, initial: float) -> Tuple[
                         "exit": exit_price,
                         "pnl": pnl,
                         "reason": exit_reason,
+                        "exit_condition": exit_text,
                         "equity_after": equity,
+                    }
+                )
+                event_log.append(
+                    {
+                        "event": "exit",
+                        "time": time,
+                        "dir": "LONG" if direction > 0 else "SHORT",
+                        "price": exit_price,
+                        "qty": qty,
+                        "pnl": pnl,
+                        "reason": exit_reason,
+                        "condition": exit_text,
+                        "equity": equity,
                     }
                 )
                 position = None
             else:
-                position["peak"] = peak
-                position["trough"] = trough
+                # exit when signal flips/flat even if no stop/TP hit
+                if signal == 0 or signal != direction:
+                    exit_price = price
+                    pnl = direction * (exit_price - entry) * qty
+                    equity += pnl
+                    exit_text = f"Signal exit @ {exit_price:.6f}"
+                    trades.append(
+                        {
+                            "time": time,
+                            "dir": "LONG" if direction > 0 else "SHORT",
+                            "entry": entry,
+                            "exit": exit_price,
+                            "pnl": pnl,
+                            "reason": "signal_exit",
+                            "exit_condition": exit_text,
+                            "equity_after": equity,
+                        }
+                    )
+                    event_log.append(
+                        {
+                            "event": "exit",
+                            "time": time,
+                            "dir": "LONG" if direction > 0 else "SHORT",
+                            "price": exit_price,
+                            "qty": qty,
+                            "pnl": pnl,
+                            "reason": "signal_exit",
+                            "condition": exit_text,
+                            "equity": equity,
+                        }
+                    )
+                    position = None
+                else:
+                    position["peak"] = peak
+                    position["trough"] = trough
 
         # consider new entry only if flat
         if not position and signal != 0:
+            _, entry_reason = bot._signal_detail(row)
             try:
                 qty, stop_price, tp_price = bot._size_position(signal, price, atr, equity_override=equity)
             except Exception:
@@ -161,14 +216,66 @@ def simulate_trades(df: pd.DataFrame, bot: FuturesBot, initial: float) -> Tuple[
                 "stop_dist": stop_distance,
                 "peak": high if signal > 0 else entry_price,
                 "trough": low if signal < 0 else entry_price,
+                "entry_reason": entry_reason,
             }
+            event_log.append(
+                {
+                    "event": "entry",
+                    "time": time,
+                    "dir": "LONG" if signal > 0 else "SHORT",
+                    "price": entry_price,
+                    "qty": qty,
+                    "stop": stop_price,
+                    "tp": tp_price,
+                    "condition": entry_reason,
+                    "equity": equity,
+                }
+            )
 
         equity_curve.append(equity)
 
-    return pd.Series(equity_curve, index=df.index), trades
+    # if backtest ends with open position, close at last price for logging
+    if position:
+        last_row = df.iloc[-1]
+        exit_price = float(last_row["close"])
+        direction = position["direction"]
+        qty = position["qty"]
+        entry = position["entry"]
+        pnl = direction * (exit_price - entry) * qty
+        equity += pnl
+        if equity_curve:
+            equity_curve[-1] = equity
+        exit_text = f"Forced close at end of data @ {exit_price:.6f}"
+        trades.append(
+            {
+                "time": last_row["time"],
+                "dir": "LONG" if direction > 0 else "SHORT",
+                "entry": entry,
+                "exit": exit_price,
+                "pnl": pnl,
+                "reason": "end_of_data",
+                "exit_condition": exit_text,
+                "equity_after": equity,
+            }
+        )
+        event_log.append(
+            {
+                "event": "exit",
+                "time": last_row["time"],
+                "dir": "LONG" if direction > 0 else "SHORT",
+                "price": exit_price,
+                "qty": qty,
+                "pnl": pnl,
+                "reason": "end_of_data",
+                "condition": exit_text,
+                "equity": equity,
+            }
+        )
+
+    return pd.Series(equity_curve, index=df.index), trades, event_log
 
 
-def backtest(symbol: str, interval: str, lookback: int, initial: float) -> Tuple[pd.DataFrame, pd.Series, List[dict]]:
+def backtest(symbol: str, interval: str, lookback: int, initial: float) -> Tuple[pd.DataFrame, pd.Series, List[dict], List[dict]]:
     api_key = os.getenv("BINANCE_API_KEY", "")
     api_secret = os.getenv("BINANCE_API_SECRET", "")
     settings = Settings(symbol=symbol, interval=interval, lookback=lookback, live=False)
@@ -195,8 +302,8 @@ def backtest(symbol: str, interval: str, lookback: int, initial: float) -> Tuple
     df["short_entry"] = (df["signal"] == -1) & (df["signal_prev"] != -1)
     df["long_exit"] = (df["signal_prev"] == 1) & (df["signal"] != 1)
     df["short_exit"] = (df["signal_prev"] == -1) & (df["signal"] != -1)
-    eq, trades = simulate_trades(df, bot, initial)
-    return df, eq, trades
+    eq, trades, event_log = simulate_trades(df, bot, initial)
+    return df, eq, trades, event_log
 
 
 def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_path: str, open_report: bool = True) -> None:
@@ -432,7 +539,7 @@ def main() -> None:
     parser.add_argument("--log", default="reports/trade_log.csv", help="CSV path to export trade log")
     args = parser.parse_args()
 
-    df, eq, trades = backtest(args.symbol.upper(), args.interval, args.lookback, args.initial)
+    df, eq, trades, event_log = backtest(args.symbol.upper(), args.interval, args.lookback, args.initial)
     final = eq.iloc[-1]
     print(f"Final equity: ${final:.2f} ({(final-args.initial)/args.initial*100:.2f}%)")
     print(f"Trades: {len(trades)}")
@@ -443,11 +550,15 @@ def main() -> None:
     # export logs instead of printing all trades
     if args.log:
         os.makedirs(os.path.dirname(args.log), exist_ok=True)
+        log_df = pd.DataFrame(event_log)
+        log_df.to_csv(args.log, index=False)
         trades_df = pd.DataFrame(trades)
-        trades_df.to_csv(args.log, index=False)
+        closed_path = args.log.replace(".csv", "_closed.csv")
+        trades_df.to_csv(closed_path, index=False)
         equity_path = args.log.replace(".csv", "_equity.csv")
         eq.to_csv(equity_path, header=["equity"])
-        print(f"Trade log written to {args.log}")
+        print(f"Trade event log written to {args.log}")
+        print(f"Closed trades written to {closed_path}")
         print(f"Equity curve written to {equity_path}")
     if args.html:
         plot_results_html(df, eq, args.symbol.upper(), args.html, open_report=not args.no_open)

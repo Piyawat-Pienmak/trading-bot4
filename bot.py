@@ -164,6 +164,14 @@ class FuturesBot:
         return df
 
     def _signal_direction(self, row: pd.Series) -> int:
+        direction, _ = self._signal_decision(row, explain=False)
+        return direction
+
+    def _signal_detail(self, row: pd.Series) -> Tuple[int, str]:
+        direction, reason = self._signal_decision(row, explain=True)
+        return direction, reason or ""
+
+    def _signal_decision(self, row: pd.Series, explain: bool) -> Tuple[int, str | None]:
         price = float(row["close"])
         ema_fast = float(row["ema_fast"])
         ema_slow = float(row["ema_slow"])
@@ -177,6 +185,7 @@ class FuturesBot:
         ll_break = bool(row.get("ll_break", False))
         vol = float(row["volume"])
         vol_sma = float(row.get("vol_sma", float("nan")))
+        reason = None
         if (
             math.isnan(ema_fast)
             or math.isnan(ema_slow)
@@ -187,15 +196,15 @@ class FuturesBot:
             or math.isnan(vol_sma)
             or math.isnan(prev_close)
         ):
-            return 0
+            return 0, "missing indicators" if explain else None
         if vol < vol_sma * self.settings.vol_min_mult:
-            return 0
+            return 0, f"volume {vol:.2f} below threshold {vol_sma * self.settings.vol_min_mult:.2f}" if explain else None
         if atr_pct < self.settings.atr_vol_min_pct:
-            return 0
+            return 0, f"atr_pct {atr_pct:.5f} below {self.settings.atr_vol_min_pct}" if explain else None
         if abs(slope) < price * self.settings.slope_min_pct:
-            return 0
+            return 0, f"slope {slope:.6f} too flat vs price {price:.6f}" if explain else None
         if abs(ema_fast - ema_slow) < price * self.settings.ema_gap_min_pct:
-            return 0
+            return 0, f"ema gap {abs(ema_fast - ema_slow):.6f} too small" if explain else None
         bullish = (
             ema_fast > ema_slow
             and price > ema_slow
@@ -219,10 +228,30 @@ class FuturesBot:
             and price < prev_close
         )
         if bullish:
-            return 1
+            if explain:
+                reason = (
+                    f"LONG: ema_fast {ema_fast:.6f}>ema_slow {ema_slow:.6f}, "
+                    f"price {price:.6f}>ema_trend {ema_trend:.6f}, slope {slope:.6f}>0, "
+                    f"rsi {rsi:.2f}>={self.settings.rsi_long}, breakout={hh_break}, "
+                    f"vol x{vol/vol_sma:.2f}>={self.settings.vol_min_mult}, "
+                    f"atr_pct {atr_pct:.5f}>={self.settings.atr_vol_min_pct}, "
+                    f"close>open {price>open_price}, close>prev_close {price>prev_close}, "
+                    f"htf_bias {self.htf_trend is None or price > self.htf_trend}"
+                )
+            return 1, reason
         if bearish:
-            return -1
-        return 0
+            if explain:
+                reason = (
+                    f"SHORT: ema_fast {ema_fast:.6f}<ema_slow {ema_slow:.6f}, "
+                    f"price {price:.6f}<ema_trend {ema_trend:.6f}, slope {slope:.6f}<0, "
+                    f"rsi {rsi:.2f}<={self.settings.rsi_short}, breakout={ll_break}, "
+                    f"vol x{vol/vol_sma:.2f}>={self.settings.vol_min_mult}, "
+                    f"atr_pct {atr_pct:.5f}>={self.settings.atr_vol_min_pct}, "
+                    f"close<open {price<open_price}, close<prev_close {price<prev_close}, "
+                    f"htf_bias {self.htf_trend is None or price < self.htf_trend}"
+                )
+            return -1, reason
+        return 0, "conditions not aligned" if explain else None
 
     def _latest_signal(self, df: pd.DataFrame) -> Tuple[int, float, float]:
         last = df.iloc[-1]
