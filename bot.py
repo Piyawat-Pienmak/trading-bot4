@@ -26,7 +26,7 @@ class Settings:
     htf_interval: str | None = "1h"  # higher timeframe for bias; None disables
     htf_trend_ema: int = 200
     breakout_lookback: int = 10  # bars for breakout filter
-    breakout_enabled: bool = True
+    breakout_enabled: bool = False
     vol_ma_period: int = 20
     vol_min_mult: float = 1.1  # require volume above average to filter chop
     rsi_period: int = 14
