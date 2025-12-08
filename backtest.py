@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import webbrowser
 from typing import List, Tuple
@@ -306,11 +307,35 @@ def backtest(symbol: str, interval: str, lookback: int, initial: float) -> Tuple
     return df, eq, trades, event_log
 
 
-def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_path: str, open_report: bool = True) -> None:
+def plot_results_html(
+    df: pd.DataFrame,
+    equity: pd.Series,
+    symbol: str,
+    output_path: str,
+    open_report: bool = True,
+    theme: str = "dark",
+) -> None:
     if output_path:
         out_dir = os.path.dirname(output_path)
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
+    is_dark = theme.lower() == "dark"
+    bg_color = "#0b1224" if is_dark else "#ffffff"
+    panel_color = "#0f172a" if is_dark else "#ffffff"
+    grid_color = "#1f2937" if is_dark else "#e5e5e5"
+    text_color = "#e5e7eb" if is_dark else "#1a1a1a"
+    spike_color = "#475569" if is_dark else "#aaaaaa"
+    candle_up = "#22c55e" if is_dark else "#2d8a5f"
+    candle_down = "#f87171" if is_dark else "#e15759"
+    candle_up_fill = "rgba(34,197,94,0.35)" if is_dark else "#6fcf97"
+    candle_down_fill = "rgba(248,113,113,0.35)" if is_dark else "#f4a6a8"
+    ema_fast_color = "#60a5fa" if is_dark else "#6fa8dc"
+    ema_slow_color = "#fbbf24" if is_dark else "#f6b26b"
+    rsi_color = "#a855f7" if is_dark else "#8b5cf6"
+    rsi_high_line = "#fb7185" if is_dark else "#f4b6c2"
+    rsi_low_line = "#4ade80" if is_dark else "#cce2cb"
+    equity_color = "#22d3ee" if is_dark else "#00695c"
+    template = "plotly_dark" if is_dark else "plotly_white"
     fig = make_subplots(
         rows=3,
         cols=1,
@@ -331,10 +356,10 @@ def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_p
             low=df["low"],
             close=df["close"],
             name="Candles",
-            increasing_line_color="#2d8a5f",
-            decreasing_line_color="#e15759",
-            increasing_fillcolor="#6fcf97",
-            decreasing_fillcolor="#f4a6a8",
+            increasing_line_color=candle_up,
+            decreasing_line_color=candle_down,
+            increasing_fillcolor=candle_up_fill,
+            decreasing_fillcolor=candle_down_fill,
             hovertemplate="Time: %{x}<br>O: %{open}<br>H: %{high}<br>L: %{low}<br>C: %{close}<extra></extra>",
             showlegend=False,
         ),
@@ -346,7 +371,7 @@ def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_p
             x=df["time"],
             y=df["ema_fast"],
             name="EMA Fast",
-            line=dict(color="#6fa8dc", width=1.2),
+            line=dict(color=ema_fast_color, width=1.2),
             hovertemplate="EMA Fast: %{y:.6f}<extra></extra>",
         ),
         row=1,
@@ -357,7 +382,7 @@ def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_p
             x=df["time"],
             y=df["ema_slow"],
             name="EMA Slow",
-            line=dict(color="#f6b26b", width=1.2),
+            line=dict(color=ema_slow_color, width=1.2),
             hovertemplate="EMA Slow: %{y:.6f}<extra></extra>",
         ),
         row=1,
@@ -368,19 +393,19 @@ def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_p
             x=df["time"],
             y=df["rsi"],
             name="RSI",
-            line=dict(color="#8b5cf6", width=1.2),
+            line=dict(color=rsi_color, width=1.2),
         ),
         row=2,
         col=1,
     )
-    fig.add_hline(y=70, line=dict(color="#f4b6c2", dash="dash"), row=2, col=1)
-    fig.add_hline(y=30, line=dict(color="#cce2cb", dash="dash"), row=2, col=1)
+    fig.add_hline(y=70, line=dict(color=rsi_high_line, dash="dash"), row=2, col=1)
+    fig.add_hline(y=30, line=dict(color=rsi_low_line, dash="dash"), row=2, col=1)
     fig.add_trace(
         go.Scatter(
             x=df["time"],
             y=equity,
             name="Equity",
-            line=dict(color="#00695c", width=1.2),
+            line=dict(color=equity_color, width=1.2),
         ),
         row=3,
         col=1,
@@ -398,7 +423,7 @@ def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_p
                 mode="markers",
                 name="Long Entry",
                 marker=dict(
-                    color="#2d8a5f",
+                    color=candle_up,
                     size=9,
                     symbol="triangle-up",
                     line=dict(color="#ffffff", width=1),
@@ -417,7 +442,7 @@ def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_p
                 mode="markers",
                 name="Short Entry",
                 marker=dict(
-                    color="#e15759",
+                    color=candle_down,
                     size=9,
                     symbol="triangle-down",
                     line=dict(color="#ffffff", width=1),
@@ -436,7 +461,7 @@ def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_p
                 mode="markers",
                 name="Long Exit",
                 marker=dict(
-                    color="#2d8a5f",
+                    color=candle_up,
                     size=9,
                     symbol="x",
                     line=dict(color="#ffffff", width=1),
@@ -455,7 +480,7 @@ def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_p
                 mode="markers",
                 name="Short Exit",
                 marker=dict(
-                    color="#e15759",
+                    color=candle_down,
                     size=9,
                     symbol="x",
                     line=dict(color="#ffffff", width=1),
@@ -469,13 +494,14 @@ def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_p
     fig.update_layout(
         hovermode="x",
         hoverdistance=10,
-        template="plotly_white",
+        template=template,
         showlegend=True,
         height=900,
         dragmode="pan",
-        plot_bgcolor="#ffffff",
-        paper_bgcolor="#ffffff",
-        font=dict(color="#1a1a1a", family="Inter, 'Helvetica Neue', Arial"),
+        plot_bgcolor=panel_color,
+        paper_bgcolor=bg_color,
+        font=dict(color=text_color, family="Inter, 'Helvetica Neue', Arial"),
+        hoverlabel=dict(bgcolor=panel_color, font=dict(color=text_color)),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=60, r=60, t=60, b=60),
         uirevision="keep",
@@ -490,8 +516,8 @@ def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_p
             spikesnap="cursor",
             spikethickness=1,
             spikedash="solid",
-            spikecolor="#aaa",
-            gridcolor="#e5e5e5",
+            spikecolor=spike_color,
+            gridcolor=grid_color,
             zeroline=False,
         )
     fig.update_xaxes(matches="x", row=2, col=1)
@@ -501,8 +527,8 @@ def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_p
         spikemode="across",
         spikethickness=1,
         spikedash="solid",
-        spikecolor="#aaa",
-        gridcolor="#e5e5e5",
+        spikecolor=spike_color,
+        gridcolor=grid_color,
         hoverformat=None,
     )
     fig.update_xaxes(rangeslider=dict(visible=False), row=1, col=1)
@@ -521,6 +547,101 @@ def plot_results_html(df: pd.DataFrame, equity: pd.Series, symbol: str, output_p
             "modeBarButtonsToRemove": ["autoScale2d"],
         },
     )
+    theme_payload = {
+        "dark": {
+            "bodyBg": "#0b1224",
+            "text": "#e5e7eb",
+            "panelBg": "#0f172a",
+            "plotly": {
+                "template": "plotly_dark",
+                "paper_bgcolor": "#0b1224",
+                "plot_bgcolor": "#0f172a",
+                "font.color": "#e5e7eb",
+                "hoverlabel.bgcolor": "#0f172a",
+                "hoverlabel.font.color": "#e5e7eb",
+                "legend.font.color": "#e5e7eb",
+                "gridcolor": grid_color,
+                "spikecolor": spike_color,
+            },
+        },
+        "light": {
+            "bodyBg": "#ffffff",
+            "text": "#1a1a1a",
+            "panelBg": "#ffffff",
+            "plotly": {
+                "template": "plotly_white",
+                "paper_bgcolor": "#ffffff",
+                "plot_bgcolor": "#ffffff",
+                "font.color": "#1a1a1a",
+                "hoverlabel.bgcolor": "#ffffff",
+                "hoverlabel.font.color": "#1a1a1a",
+                "legend.font.color": "#1a1a1a",
+                "gridcolor": grid_color,
+                "spikecolor": spike_color,
+            },
+        },
+    }
+    style_block = (
+        "<style>"
+        "body{margin:0;background:%(bg)s;color:%(text)s;font-family:Inter, 'Helvetica Neue', Arial, sans-serif;}"
+        "#controls{position:sticky;top:0;z-index:10;padding:12px 16px;background:rgba(0,0,0,0.08);backdrop-filter:blur(6px);display:flex;justify-content:flex-end;}"
+        "#theme-toggle{border:none;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer;background:%(text)s;color:%(bg)s;box-shadow:0 2px 6px rgba(0,0,0,0.2);}"
+        "#theme-toggle:hover{opacity:0.9;}"
+        "#backtest-chart{background:%(panel)s;}"
+        "</style>"
+        % {"bg": bg_color, "text": text_color, "panel": panel_color}
+    )
+    toggle_block = (
+        '<div id="controls"><button id="theme-toggle">'
+        + ("Light mode" if is_dark else "Dark mode")
+        + "</button></div>"
+    )
+    script_block = f"""
+<script>
+const THEMES = {json.dumps(theme_payload)};
+let currentTheme = "{'dark' if is_dark else 'light'}";
+function applyTheme() {{
+  const t = THEMES[currentTheme];
+  document.body.style.background = t.bodyBg;
+  document.body.style.color = t.text;
+  const chart = document.getElementById("backtest-chart");
+  if (chart && window.Plotly) {{
+    const axes = Object.keys(chart.layout).filter(k => k.startsWith("xaxis") || k.startsWith("yaxis"));
+    const updates = {{
+      template: t.plotly.template,
+      paper_bgcolor: t.plotly.paper_bgcolor,
+      plot_bgcolor: t.plotly.plot_bgcolor,
+      "font.color": t.plotly["font.color"],
+      "hoverlabel.bgcolor": t.plotly["hoverlabel.bgcolor"],
+      "hoverlabel.font.color": t.plotly["hoverlabel.font.color"],
+      "legend.font.color": t.plotly["legend.font.color"],
+    }};
+    axes.forEach(ax => {{
+      updates[`${{ax}}.gridcolor`] = t.plotly.gridcolor;
+      updates[`${{ax}}.spikecolor`] = t.plotly.spikecolor;
+    }});
+    Plotly.relayout(chart, updates);
+  }}
+  const btn = document.getElementById("theme-toggle");
+  if (btn) btn.textContent = currentTheme === "dark" ? "Light mode" : "Dark mode";
+}}
+document.addEventListener("DOMContentLoaded", () => {{
+  const btn = document.getElementById("theme-toggle");
+  if (btn) {{
+    btn.addEventListener("click", () => {{
+      currentTheme = currentTheme === "dark" ? "light" : "dark";
+      applyTheme();
+    }});
+  }}
+  applyTheme();
+}});
+</script>"""
+    if "</head>" in html_str:
+        html_str = html_str.replace("</head>", f"{style_block}</head>")
+    if "<body>" in html_str:
+        html_str = html_str.replace("<body>", f"<body>{toggle_block}")
+    if "</body>" in html_str:
+        html_str = html_str.replace("</body>", f"{script_block}</body>")
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html_str)
     if open_report:
@@ -535,6 +656,7 @@ def main() -> None:
     parser.add_argument("--lookback", type=int, default=500)
     parser.add_argument("--initial", type=float, default=25.0, help="starting equity")
     parser.add_argument("--html", default="reports/backtest_report.html", help="output HTML report path (set empty to skip)")
+    parser.add_argument("--theme", choices=["dark", "light"], default="dark", help="color theme for the HTML report")
     parser.add_argument("--no-open", action="store_true", help="skip opening HTML automatically")
     parser.add_argument("--log", default="reports/trade_log.csv", help="CSV path to export trade log")
     args = parser.parse_args()
@@ -561,7 +683,7 @@ def main() -> None:
         print(f"Closed trades written to {closed_path}")
         print(f"Equity curve written to {equity_path}")
     if args.html:
-        plot_results_html(df, eq, args.symbol.upper(), args.html, open_report=not args.no_open)
+        plot_results_html(df, eq, args.symbol.upper(), args.html, open_report=not args.no_open, theme=args.theme)
         print(f"HTML report written to {args.html}")
         if args.no_open:
             print("Open the report in your browser to view the interactive crosshairs.")
