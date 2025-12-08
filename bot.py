@@ -51,6 +51,13 @@ class Settings:
     testnet: bool = False
     live: bool = False
     base_url: str | None = "https://fapi.binance.com"
+    volume_filter: bool = False
+    atr_vol_filter: bool = True
+    slope_filter: bool = False
+    ema_gap_filter: bool = True
+    rsi_filter: bool = False
+    candle_bias_filter: bool = False
+    htf_bias_filter: bool = False
 
 
 class FuturesBot:
@@ -190,66 +197,98 @@ class FuturesBot:
             math.isnan(ema_fast)
             or math.isnan(ema_slow)
             or math.isnan(ema_trend)
-            or math.isnan(rsi)
             or math.isnan(atr_pct)
-            or math.isnan(slope)
-            or math.isnan(vol_sma)
-            or math.isnan(prev_close)
+            or (self.settings.rsi_filter and math.isnan(rsi))
+            or (self.settings.slope_filter and math.isnan(slope))
+            or (self.settings.volume_filter and math.isnan(vol_sma))
+            or (self.settings.candle_bias_filter and math.isnan(prev_close))
         ):
             return 0, "missing indicators" if explain else None
-        if vol < vol_sma * self.settings.vol_min_mult:
+        if self.settings.volume_filter and vol < vol_sma * self.settings.vol_min_mult:
             return 0, f"volume {vol:.2f} below threshold {vol_sma * self.settings.vol_min_mult:.2f}" if explain else None
-        if atr_pct < self.settings.atr_vol_min_pct:
+        if self.settings.atr_vol_filter and atr_pct < self.settings.atr_vol_min_pct:
             return 0, f"atr_pct {atr_pct:.5f} below {self.settings.atr_vol_min_pct}" if explain else None
-        if abs(slope) < price * self.settings.slope_min_pct:
+        if self.settings.slope_filter and abs(slope) < price * self.settings.slope_min_pct:
             return 0, f"slope {slope:.6f} too flat vs price {price:.6f}" if explain else None
-        if abs(ema_fast - ema_slow) < price * self.settings.ema_gap_min_pct:
+        if self.settings.ema_gap_filter and abs(ema_fast - ema_slow) < price * self.settings.ema_gap_min_pct:
             return 0, f"ema gap {abs(ema_fast - ema_slow):.6f} too small" if explain else None
+        slope_long_ok = slope > 0 or not self.settings.slope_filter
+        slope_short_ok = slope < 0 or not self.settings.slope_filter
+        breakout_long_ok = hh_break if self.settings.breakout_enabled else True
+        breakout_short_ok = ll_break if self.settings.breakout_enabled else True
+        htf_long_ok = (self.htf_trend is None or price > self.htf_trend) or not self.settings.htf_bias_filter
+        htf_short_ok = (self.htf_trend is None or price < self.htf_trend) or not self.settings.htf_bias_filter
+        candle_long_ok = (price > open_price and price > prev_close) or not self.settings.candle_bias_filter
+        candle_short_ok = (price < open_price and price < prev_close) or not self.settings.candle_bias_filter
+        rsi_long_ok = (rsi >= self.settings.rsi_long) if self.settings.rsi_filter else True
+        rsi_short_ok = (rsi <= self.settings.rsi_short) if self.settings.rsi_filter else True
         bullish = (
             ema_fast > ema_slow
             and price > ema_slow
             and price > ema_trend
-            and rsi >= self.settings.rsi_long
-            and slope > 0
-            and hh_break
-            and (self.htf_trend is None or price > self.htf_trend)
-            and price > open_price
-            and price > prev_close
+            and slope_long_ok
+            and breakout_long_ok
+            and htf_long_ok
+            and candle_long_ok
+            and rsi_long_ok
         )
         bearish = (
             ema_fast < ema_slow
             and price < ema_slow
             and price < ema_trend
-            and rsi <= self.settings.rsi_short
-            and slope < 0
-            and ll_break
-            and (self.htf_trend is None or price < self.htf_trend)
-            and price < open_price
-            and price < prev_close
+            and slope_short_ok
+            and breakout_short_ok
+            and htf_short_ok
+            and candle_short_ok
+            and rsi_short_ok
         )
         if bullish:
             if explain:
-                reason = (
-                    f"LONG: ema_fast({self.settings.fast_ema}) {ema_fast:.6f}>ema_slow({self.settings.slow_ema}) {ema_slow:.6f}, "
-                    f"price {price:.6f}>ema_trend {ema_trend:.6f}, slope {slope:.6f}>0, "
-                    f"rsi {rsi:.2f}>={self.settings.rsi_long}, breakout={hh_break}, "
-                    f"vol x{vol/vol_sma:.2f}>={self.settings.vol_min_mult}, "
-                    f"atr_pct {atr_pct:.5f}>={self.settings.atr_vol_min_pct}, "
-                    f"close>open {price>open_price}, close>prev_close {price>prev_close}, "
-                    f"htf_bias {self.htf_trend is None or price > self.htf_trend}"
-                )
+                parts = [
+                    f"LONG: ema_fast({self.settings.fast_ema}) {ema_fast:.6f}>ema_slow({self.settings.slow_ema}) {ema_slow:.6f}",
+                    f"price {price:.6f}>ema_trend {ema_trend:.6f}",
+                ]
+                if self.settings.rsi_filter:
+                    parts.append(f"rsi {rsi:.2f}>={self.settings.rsi_long}")
+                if self.settings.slope_filter:
+                    parts.append(f"slope {slope:.6f}>0")
+                if self.settings.ema_gap_filter:
+                    parts.append(f"ema_gap {abs(ema_fast - ema_slow):.6f}>={price * self.settings.ema_gap_min_pct:.6f}")
+                if self.settings.breakout_enabled:
+                    parts.append(f"breakout={hh_break}")
+                if self.settings.volume_filter:
+                    parts.append(f"vol x{vol/vol_sma:.2f}>={self.settings.vol_min_mult}")
+                if self.settings.atr_vol_filter:
+                    parts.append(f"atr_pct {atr_pct:.5f}>={self.settings.atr_vol_min_pct}")
+                if self.settings.candle_bias_filter:
+                    parts.append(f"close>open {price>open_price}, close>prev_close {price>prev_close}")
+                if self.settings.htf_bias_filter:
+                    parts.append(f"htf_bias {self.htf_trend is None or price > self.htf_trend}")
+                reason = ", ".join(parts)
             return 1, reason
         if bearish:
             if explain:
-                reason = (
-                    f"SHORT: ema_fast({self.settings.fast_ema}) {ema_fast:.6f}<ema_slow({self.settings.slow_ema}) {ema_slow:.6f}, "
-                    f"price {price:.6f}<ema_trend {ema_trend:.6f}, slope {slope:.6f}<0, "
-                    f"rsi {rsi:.2f}<={self.settings.rsi_short}, breakout={ll_break}, "
-                    f"vol x{vol/vol_sma:.2f}>={self.settings.vol_min_mult}, "
-                    f"atr_pct {atr_pct:.5f}>={self.settings.atr_vol_min_pct}, "
-                    f"close<open {price<open_price}, close<prev_close {price<prev_close}, "
-                    f"htf_bias {self.htf_trend is None or price < self.htf_trend}"
-                )
+                parts = [
+                    f"SHORT: ema_fast({self.settings.fast_ema}) {ema_fast:.6f}<ema_slow({self.settings.slow_ema}) {ema_slow:.6f}",
+                    f"price {price:.6f}<ema_trend {ema_trend:.6f}",
+                ]
+                if self.settings.rsi_filter:
+                    parts.append(f"rsi {rsi:.2f}<={self.settings.rsi_short}")
+                if self.settings.slope_filter:
+                    parts.append(f"slope {slope:.6f}<0")
+                if self.settings.ema_gap_filter:
+                    parts.append(f"ema_gap {abs(ema_fast - ema_slow):.6f}>={price * self.settings.ema_gap_min_pct:.6f}")
+                if self.settings.breakout_enabled:
+                    parts.append(f"breakout={ll_break}")
+                if self.settings.volume_filter:
+                    parts.append(f"vol x{vol/vol_sma:.2f}>={self.settings.vol_min_mult}")
+                if self.settings.atr_vol_filter:
+                    parts.append(f"atr_pct {atr_pct:.5f}>={self.settings.atr_vol_min_pct}")
+                if self.settings.candle_bias_filter:
+                    parts.append(f"close<open {price < open_price}, close<prev_close {price < prev_close}")
+                if self.settings.htf_bias_filter:
+                    parts.append(f"htf_bias {self.htf_trend is None or price < self.htf_trend}")
+                reason = ", ".join(parts)
             return -1, reason
         return 0, "conditions not aligned" if explain else None
 
