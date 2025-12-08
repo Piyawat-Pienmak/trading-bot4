@@ -32,7 +32,7 @@ class Settings:
     rsi_period: int = 14
     rsi_long: float = 57.0
     rsi_short: float = 43.0
-    atr_vol_min_pct: float = 0.003
+    atr_vol_min_pct: float = 0.008
     trend_lookback: int = 3
     atr_period: int = 14
     atr_multiplier: float = 2.5
@@ -52,11 +52,11 @@ class Settings:
     live: bool = False
     base_url: str | None = "https://fapi.binance.com"
     volume_filter: bool = False
-    atr_vol_filter: bool = False
+    atr_vol_filter: bool = True
     slope_filter: bool = False
     ema_gap_filter: bool = False
     rsi_filter: bool = False
-    candle_bias_filter: bool = False
+    candle_bias_filter: bool = True
     htf_bias_filter: bool = False
 
 
