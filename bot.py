@@ -52,7 +52,7 @@ class Settings:
     live: bool = False
     base_url: str | None = "https://fapi.binance.com"
     volume_filter: bool = False
-    atr_vol_filter: bool = True
+    atr_vol_filter: bool = False
     slope_filter: bool = False
     ema_gap_filter: bool = False
     rsi_filter: bool = False
