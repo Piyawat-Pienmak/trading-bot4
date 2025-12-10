@@ -29,6 +29,23 @@ Python starter for a risk-conscious Binance USDⓈ-M futures bot. It pulls marke
   # Add --no-open to skip auto-opening the browser
   ```
 
+## IP change alerts
+
+Run `python ip_monitor.py` to email yourself when the machine's public IP changes. Configure SMTPS creds in `.env`:
+```
+IP_ALERT_EMAIL=you@example.com          # recipient (and default sender)
+IP_SMTP_USER=you@example.com            # SMTP auth user (defaults to IP_ALERT_EMAIL)
+IP_SMTP_PASSWORD=your_smtp_app_password
+IP_SMTP_HOST=smtp.gmail.com
+IP_SMTP_PORT=465                        # SSL/SMTPS port
+IP_WATCH_STATE_FILE=data/state/ip_watch.json  # cache file
+IP_WATCH_ENDPOINT=https://api.ipify.org      # IP service
+```
+Flags:
+- `--interval N` keeps polling every N seconds (0 runs once).
+- `--force` sends even if the IP hasn't changed.
+Schedule with cron/systemd to keep receiving alerts when your public IP updates.
+
 ## What it does
 
 - On each 1H close, trades a simple EMA200 + 24-bar breakout: longs when price > EMA200, EMA200 rising (vs 10 bars ago), and price breaks the prior 24-bar high; shorts are the mirror.

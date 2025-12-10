@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -31,6 +32,9 @@ class Settings:
     testnet: bool = False
     live: bool = False
     base_url: str | None = "https://fapi.binance.com"
+    loop: bool = False
+    poll_seconds: int = 300
+    live_log: str = "reports/live_trades.csv"
 
 
 class FuturesBot:
@@ -43,6 +47,9 @@ class FuturesBot:
             base_url = "https://fapi.binance.com"
         self.client = UMFutures(key=api_key, secret=api_secret, base_url=base_url)
         self.filters = self._fetch_filters(settings.symbol)
+        self._live_state: dict | None = None
+        self._equity_cache: float | None = None
+        os.makedirs(os.path.dirname(self.settings.live_log) or ".", exist_ok=True)
 
     def _fetch_filters(self, symbol: str) -> Dict[str, float]:
         info = self.client.exchange_info()
@@ -194,6 +201,140 @@ class FuturesBot:
         direction = self._signal_direction(last)
         return direction, price, atr
 
+    def _order_trades(self, order_id: int) -> List[dict]:
+        try:
+            trades = self.client.user_trades(symbol=self.settings.symbol, orderId=order_id)
+        except ClientError:
+            return []
+        return trades or []
+
+    def _trades_avg_price_and_fee(self, trades: List[dict]) -> Tuple[float, float]:
+        if not trades:
+            return 0.0, 0.0
+        total_qty = 0.0
+        total_quote = 0.0
+        total_fee = 0.0
+        for t in trades:
+            qty = float(t.get("qty", 0) or 0.0)
+            price = float(t.get("price", 0) or 0.0)
+            fee = float(t.get("commission", 0) or 0.0)
+            total_qty += qty
+            total_quote += qty * price
+            total_fee += fee
+        avg_price = (total_quote / total_qty) if total_qty > 0 else 0.0
+        return avg_price, total_fee
+
+    def _process_live_exit(self) -> None:
+        if not self.settings.live or not self._live_state:
+            return
+        stop_id = self._live_state.get("stop_order_id")
+        tp_id = self._live_state.get("tp_order_id")
+        filled_id = None
+        reason = None
+        def _order_status(oid: int) -> str:
+            try:
+                res = self.client.get_order(symbol=self.settings.symbol, orderId=oid)
+                return res.get("status", "")
+            except ClientError:
+                return ""
+        if stop_id:
+            status = _order_status(stop_id)
+            if status == "FILLED":
+                filled_id = stop_id
+                reason = "hit_sl"
+        if tp_id and filled_id is None:
+            status = _order_status(tp_id)
+            if status == "FILLED":
+                filled_id = tp_id
+                reason = "hit_tp"
+        if filled_id is None:
+            return
+        trades = self._order_trades(filled_id)
+        exit_price, exit_fee = self._trades_avg_price_and_fee(trades)
+        direction = self._live_state.get("direction", "")
+        entry_price = float(self._live_state.get("entry_price", 0.0) or 0.0)
+        entry_fee = float(self._live_state.get("entry_fee", 0.0) or 0.0)
+        size = float(self._live_state.get("size", 0.0) or 0.0)
+        if exit_price <= 0:
+            exit_price = entry_price
+        gross_pnl = (exit_price - entry_price) * size if direction == "long" else (entry_price - exit_price) * size
+        fees = entry_fee + exit_fee
+        net_pnl = gross_pnl - fees
+        equity_after = self._wallet_equity()
+        self._equity_cache = equity_after
+        self._append_log_row(
+            {
+                "timestamp_entry": self._live_state.get("timestamp_entry", ""),
+                "timestamp_exit": pd.Timestamp.utcnow().isoformat(),
+                "direction": direction.upper(),
+                "entry_price": round(entry_price, 8),
+                "exit_price": round(exit_price, 8),
+                "size": size,
+                "sl_price": self._live_state.get("sl_price", ""),
+                "tp_price": self._live_state.get("tp_price", ""),
+                "gross_pnl": round(gross_pnl, 8),
+                "fees": round(fees, 8),
+                "net_pnl": round(net_pnl, 8),
+                "equity_after_trade": round(equity_after, 8),
+                "reason_exit": reason or "",
+            }
+        )
+        print(f"[live] exit detected ({reason}); logged trade with net PnL {net_pnl:.6f}")
+        self._live_state = None
+
+    def _wallet_equity(self) -> float:
+        balances = self.client.balance()
+        usdt = next((b for b in balances if b.get("asset") == "USDT"), None)
+        if not usdt:
+            return 0.0
+        return float(usdt.get("balance", 0.0) or 0.0)
+
+    def _append_log_row(self, row: Dict[str, object]) -> None:
+        path = self.settings.live_log
+        header_needed = not os.path.exists(path)
+        with open(path, "a", encoding="ascii") as f:
+            if header_needed:
+                f.write(
+                    ",".join(
+                        [
+                            "timestamp_entry",
+                            "timestamp_exit",
+                            "direction",
+                            "entry_price",
+                            "exit_price",
+                            "size",
+                            "sl_price",
+                            "tp_price",
+                            "gross_pnl",
+                            "fees",
+                            "net_pnl",
+                            "equity_after_trade",
+                            "reason_exit",
+                        ]
+                    )
+                    + "\n"
+                )
+            f.write(
+                ",".join(
+                    [
+                        str(row.get("timestamp_entry", "")),
+                        str(row.get("timestamp_exit", "")),
+                        str(row.get("direction", "")),
+                        f"{row.get('entry_price', '')}",
+                        f"{row.get('exit_price', '')}",
+                        f"{row.get('size', '')}",
+                        f"{row.get('sl_price', '')}",
+                        f"{row.get('tp_price', '')}",
+                        f"{row.get('gross_pnl', '')}",
+                        f"{row.get('fees', '')}",
+                        f"{row.get('net_pnl', '')}",
+                        f"{row.get('equity_after_trade', '')}",
+                        str(row.get("reason_exit", "")),
+                    ]
+                )
+                + "\n"
+            )
+
     def _round_to(self, value: float, step: float) -> float:
         precision = max(int(round(-math.log(step, 10))) if step < 1 else 0, 0)
         return round(math.floor(value / step) * step, precision)
@@ -260,7 +401,7 @@ class FuturesBot:
         stop_price: float,
         tp_price: float,
         price: float,
-    ) -> None:
+    ) -> dict:
         side = "BUY" if direction > 0 else "SELL"
         exit_side = "SELL" if direction > 0 else "BUY"
         print(
@@ -274,6 +415,7 @@ class FuturesBot:
             quantity=str(qty),
         )
         print(f"[live] entry order id: {order.get('orderId')}")
+        entry_order_id = int(order.get("orderId"))
         stop_order = self.client.new_order(
             symbol=self.settings.symbol,
             side=exit_side,
@@ -293,6 +435,24 @@ class FuturesBot:
             workingType="MARK_PRICE",
         )
         print(f"[live] take-profit set id: {tp_order.get('orderId')}")
+        stop_order_id = int(stop_order.get("orderId"))
+        tp_order_id = int(tp_order.get("orderId"))
+        trades = self._order_trades(entry_order_id)
+        entry_price, entry_fee = self._trades_avg_price_and_fee(trades)
+        if entry_price <= 0:
+            entry_price = float(order.get("avgPrice") or price)
+        return {
+            "direction": "long" if direction > 0 else "short",
+            "entry_order_id": entry_order_id,
+            "stop_order_id": stop_order_id,
+            "tp_order_id": tp_order_id,
+            "entry_price": entry_price,
+            "entry_fee": entry_fee,
+            "size": qty,
+            "sl_price": stop_price,
+            "tp_price": tp_price,
+            "timestamp_entry": pd.Timestamp.utcnow().isoformat(),
+        }
 
     def _build_orders(
         self, direction: int, price: float, atr: float
@@ -312,6 +472,7 @@ class FuturesBot:
         return qty, stop_price, tp_price
 
     def run_once(self) -> None:
+        self._process_live_exit()
         klines = self.fetch_klines()
         with_indicators = self._compute_indicators(klines)
         direction, price, atr = self._latest_signal(with_indicators)
@@ -338,7 +499,9 @@ class FuturesBot:
             return
         self._ensure_leverage()
         try:
-            self._place_orders(direction, qty, stop_price, tp_price, slippage_price)
+            state = self._place_orders(direction, qty, stop_price, tp_price, slippage_price)
+            self._live_state = state
+            print(f"[live] entry logged at {state['entry_price']:.6f}, waiting for exit")
         except ClientError as exc:
             print(f"[error] order failed: {exc.error_message}")
 
@@ -353,8 +516,24 @@ def parse_settings() -> Settings:
         default=int(os.getenv("BOT_LOOKBACK", "300")),
         help="number of candles to fetch (pagination; Binance limit 1500 per call)",
     )
+    parser.add_argument(
+        "--sleep",
+        type=int,
+        default=int(os.getenv("BOT_SLEEP", "300")),
+        help="seconds to sleep between cycles when --loop is enabled",
+    )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help="keep polling continuously instead of exiting after one check",
+    )
     parser.add_argument("--live", action="store_true", help="execute live orders")
     parser.add_argument("--testnet", action="store_true", help="use Binance Futures testnet")
+    parser.add_argument(
+        "--live-log",
+        default=os.getenv("BOT_LIVE_LOG", "reports/live_trades.csv"),
+        help="CSV path to append live trade logs",
+    )
     args = parser.parse_args()
     testnet_env = os.getenv("BINANCE_TESTNET", "0") == "1"
     return Settings(
@@ -363,6 +542,9 @@ def parse_settings() -> Settings:
         lookback=args.lookback,
         testnet=args.testnet or testnet_env,
         live=args.live,
+        loop=args.loop,
+        poll_seconds=max(1, args.sleep),
+        live_log=args.live_log,
     )
 
 
@@ -373,7 +555,19 @@ def main() -> None:
         raise RuntimeError("BINANCE_API_KEY/SECRET required in .env")
     settings = parse_settings()
     bot = FuturesBot(settings=settings, api_key=api_key, api_secret=api_secret)
-    bot.run_once()
+    cycle = 0
+    try:
+        while True:
+            cycle += 1
+            print(f"\n[cycle] {cycle} @ {pd.Timestamp.utcnow().isoformat()}Z")
+            bot.run_once()
+            if not settings.loop:
+                break
+            sleep_for = max(1, settings.poll_seconds)
+            print(f"[sleep] waiting {sleep_for}s before next check")
+            time.sleep(sleep_for)
+    except KeyboardInterrupt:
+        print("\n[info] interrupted by user; exiting")
 
 
 if __name__ == "__main__":
