@@ -16,48 +16,21 @@ load_dotenv()
 @dataclass
 class Settings:
     symbol: str
-    interval: str = "15m"
-    lookback: int = 200
-    fast_ema: int = 9
-    slow_ema: int = 21
-    trend_ema: int = 200
-    slope_min_pct: float = 0.00025  # require minimum slope magnitude vs price
-    ema_gap_min_pct: float = 0.0001  # require min fast/slow separation vs price to avoid chop
-    htf_interval: str | None = "1h"  # higher timeframe for bias; None disables
-    htf_trend_ema: int = 200
-    breakout_lookback: int = 10  # bars for breakout filter
-    breakout_enabled: bool = False
-    vol_ma_period: int = 20
-    vol_min_mult: float = 1.1  # require volume above average to filter chop
-    rsi_period: int = 14
-    rsi_long: float = 57.0
-    rsi_short: float = 43.0
-    atr_vol_min_pct: float = 0.008
-    trend_lookback: int = 3
+    interval: str = "1h"
+    lookback: int = 300
     atr_period: int = 14
-    atr_multiplier: float = 2.5
-    take_profit_rr: float = 2.0
-    break_even_rr: float = 1.0
-    trailing_start_rr: float = 1.5
-    trailing_callback_pct: float = 0.4  # Binance min 0.1, max 5
-    partial_tp_enabled: bool = True
-    partial_tp_ratio: float = 0.5  # fraction to take off at first TP
-    partial_tp_rr: float = 1.0
+    ema_period: int = 200
+    breakout_lookback: int = 24
+    stop_atr_mult: float = 2.0
+    tp_rr: float = 3.0
     max_notional: float | None = None
-    leverage: int = 5
-    risk_pct: float = 0.01  # 1% of equity per trade
+    leverage: int = 3
+    risk_pct: float = 0.01
     initial_equity: float = 25.0
     max_slippage_pct: float = 0.0015
     testnet: bool = False
     live: bool = False
     base_url: str | None = "https://fapi.binance.com"
-    volume_filter: bool = False
-    atr_vol_filter: bool = False
-    slope_filter: bool = False
-    ema_gap_filter: bool = False
-    rsi_filter: bool = False
-    candle_bias_filter: bool = True
-    htf_bias_filter: bool = False
 
 
 class FuturesBot:
@@ -70,7 +43,6 @@ class FuturesBot:
             base_url = "https://fapi.binance.com"
         self.client = UMFutures(key=api_key, secret=api_secret, base_url=base_url)
         self.filters = self._fetch_filters(settings.symbol)
-        self.htf_trend: float | None = None
 
     def _fetch_filters(self, symbol: str) -> Dict[str, float]:
         info = self.client.exchange_info()
@@ -90,13 +62,32 @@ class FuturesBot:
         }
 
     def fetch_klines(self) -> pd.DataFrame:
-        klines = self.client.klines(
-            symbol=self.settings.symbol,
-            interval=self.settings.interval,
-            limit=self.settings.lookback,
-        )
+        """Paginate Binance klines to collect up to lookback candles (1500 max per call)."""
+        target = max(1, int(self.settings.lookback))
+        per_call = 1500
+        rows: List[list] = []
+        end_time = None
+
+        while len(rows) < target:
+            limit = min(per_call, target - len(rows))
+            params = {
+                "symbol": self.settings.symbol,
+                "interval": self.settings.interval,
+                "limit": limit,
+            }
+            if end_time is not None:
+                params["endTime"] = end_time
+            batch = self.client.klines(**params)
+            if not batch:
+                break
+            rows.extend(batch)
+            # Walk backward in time using earliest candle's open_time
+            end_time = batch[0][0] - 1
+            if len(batch) < limit:
+                break
+
         df = pd.DataFrame(
-            klines,
+            rows,
             columns=[
                 "open_time",
                 "open",
@@ -112,62 +103,42 @@ class FuturesBot:
                 "ignore",
             ],
         )
+        if df.empty:
+            return df
+        # chronological order
+        df.sort_values("open_time", inplace=True)
+        df.reset_index(drop=True, inplace=True)
         # drop last incomplete candle (close_time in future)
-        if not df.empty:
-            now_ms = pd.Timestamp.utcnow().timestamp() * 1000
-            if now_ms < float(df.iloc[-1]["close_time"]):
-                df = df.iloc[:-1]
+        now_ms = pd.Timestamp.utcnow().timestamp() * 1000
+        if now_ms < float(df.iloc[-1]["close_time"]):
+            df = df.iloc[:-1]
         df[["open", "high", "low", "close"]] = df[
             ["open", "high", "low", "close"]
         ].astype(float)
         return df
 
-    def _fetch_htf_trend(self) -> float | None:
-        if not self.settings.htf_interval:
-            return None
-        klines = self.client.klines(
-            symbol=self.settings.symbol,
-            interval=self.settings.htf_interval,
-            limit=self.settings.trend_ema + 5,
-        )
-        df = pd.DataFrame(klines, columns=["open_time", "open", "high", "low", "close", "volume", "close_time", "quote_asset_volume", "trades", "taker_base_vol", "taker_quote_vol", "ignore"])
-        df["close"] = df["close"].astype(float)
-        df["ema_htf"] = df["close"].ewm(span=self.settings.htf_trend_ema, adjust=False).mean()
-        return float(df["ema_htf"].iloc[-1])
-
-    def _compute_rsi(self, series: pd.Series) -> pd.Series:
-        delta = series.diff()
-        gain = delta.where(delta > 0, 0.0).rolling(self.settings.rsi_period).mean()
-        loss = (-delta.where(delta < 0, 0.0)).rolling(self.settings.rsi_period).mean()
-        rs = gain / loss.replace(0, pd.NA)
-        rsi = 100 - (100 / (1 + rs))
-        return rsi.fillna(50)
-
     def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        df["ema_fast"] = df["close"].ewm(span=self.settings.fast_ema, adjust=False).mean()
-        df["ema_slow"] = df["close"].ewm(span=self.settings.slow_ema, adjust=False).mean()
-        df["ema_trend"] = df["close"].ewm(span=self.settings.trend_ema, adjust=False).mean()
-        if self.settings.breakout_enabled:
-            hh = df["close"].rolling(window=self.settings.breakout_lookback, min_periods=2).max().shift(1)
-            ll = df["close"].rolling(window=self.settings.breakout_lookback, min_periods=2).min().shift(1)
-            df["hh_break"] = df["close"] > hh
-            df["ll_break"] = df["close"] < ll
-        else:
-            df["hh_break"] = True
-            df["ll_break"] = True
-        df["vol_sma"] = df["volume"].rolling(window=self.settings.vol_ma_period, min_periods=5).mean()
-        df["prev_close"] = df["close"].shift(1)
+        df["ema200"] = df["close"].ewm(span=self.settings.ema_period, adjust=False).mean()
+        df["ema200_10"] = df["ema200"].shift(10)
         df["high_low"] = df["high"] - df["low"]
+        df["prev_close"] = df["close"].shift(1)
         df["high_close"] = (df["high"] - df["prev_close"]).abs()
         df["low_close"] = (df["low"] - df["prev_close"]).abs()
         df["tr"] = df[["high_low", "high_close", "low_close"]].max(axis=1)
-        df["atr"] = (
-            df["tr"].rolling(window=self.settings.atr_period, min_periods=1).mean()
+        df["atr"] = df["tr"].rolling(window=self.settings.atr_period, min_periods=1).mean()
+        df["hh24_prev"] = (
+            df["high"]
+            .rolling(window=self.settings.breakout_lookback, min_periods=self.settings.breakout_lookback)
+            .max()
+            .shift(1)
         )
-        df["rsi"] = self._compute_rsi(df["close"])
-        df["atr_pct"] = df["atr"] / df["close"].replace(0, pd.NA)
-        df["slow_slope"] = df["ema_slow"] - df["ema_slow"].shift(self.settings.trend_lookback)
+        df["ll24_prev"] = (
+            df["low"]
+            .rolling(window=self.settings.breakout_lookback, min_periods=self.settings.breakout_lookback)
+            .min()
+            .shift(1)
+        )
         return df
 
     def _signal_direction(self, row: pd.Series) -> int:
@@ -180,115 +151,39 @@ class FuturesBot:
 
     def _signal_decision(self, row: pd.Series, explain: bool) -> Tuple[int, str | None]:
         price = float(row["close"])
-        ema_fast = float(row["ema_fast"])
-        ema_slow = float(row["ema_slow"])
-        ema_trend = float(row["ema_trend"])
-        open_price = float(row["open"])
-        prev_close = float(row["prev_close"])
-        rsi = float(row["rsi"])
-        atr_pct = float(row["atr_pct"])
-        slope = float(row["slow_slope"])
-        hh_break = bool(row.get("hh_break", False))
-        ll_break = bool(row.get("ll_break", False))
-        vol = float(row["volume"])
-        vol_sma = float(row.get("vol_sma", float("nan")))
+        ema200 = float(row["ema200"])
+        ema200_10 = float(row.get("ema200_10", float("nan")))
+        atr = float(row["atr"])
+        hh24_prev = float(row.get("hh24_prev", float("nan")))
+        ll24_prev = float(row.get("ll24_prev", float("nan")))
         reason = None
         if (
-            math.isnan(ema_fast)
-            or math.isnan(ema_slow)
-            or math.isnan(ema_trend)
-            or math.isnan(atr_pct)
-            or (self.settings.rsi_filter and math.isnan(rsi))
-            or (self.settings.slope_filter and math.isnan(slope))
-            or (self.settings.volume_filter and math.isnan(vol_sma))
-            or (self.settings.candle_bias_filter and math.isnan(prev_close))
+            math.isnan(ema200)
+            or math.isnan(ema200_10)
+            or math.isnan(atr)
+            or math.isnan(hh24_prev)
+            or math.isnan(ll24_prev)
         ):
             return 0, "missing indicators" if explain else None
-        if self.settings.volume_filter and vol < vol_sma * self.settings.vol_min_mult:
-            return 0, f"volume {vol:.2f} below threshold {vol_sma * self.settings.vol_min_mult:.2f}" if explain else None
-        if self.settings.atr_vol_filter and atr_pct < self.settings.atr_vol_min_pct:
-            return 0, f"atr_pct {atr_pct:.5f} below {self.settings.atr_vol_min_pct}" if explain else None
-        if self.settings.slope_filter and abs(slope) < price * self.settings.slope_min_pct:
-            return 0, f"slope {slope:.6f} too flat vs price {price:.6f}" if explain else None
-        if self.settings.ema_gap_filter and abs(ema_fast - ema_slow) < price * self.settings.ema_gap_min_pct:
-            return 0, f"ema gap {abs(ema_fast - ema_slow):.6f} too small" if explain else None
-        slope_long_ok = slope > 0 or not self.settings.slope_filter
-        slope_short_ok = slope < 0 or not self.settings.slope_filter
-        breakout_long_ok = hh_break if self.settings.breakout_enabled else True
-        breakout_short_ok = ll_break if self.settings.breakout_enabled else True
-        htf_long_ok = (self.htf_trend is None or price > self.htf_trend) or not self.settings.htf_bias_filter
-        htf_short_ok = (self.htf_trend is None or price < self.htf_trend) or not self.settings.htf_bias_filter
-        candle_long_ok = (price > open_price and price > prev_close) or not self.settings.candle_bias_filter
-        candle_short_ok = (price < open_price and price < prev_close) or not self.settings.candle_bias_filter
-        rsi_long_ok = (rsi >= self.settings.rsi_long) if self.settings.rsi_filter else True
-        rsi_short_ok = (rsi <= self.settings.rsi_short) if self.settings.rsi_filter else True
-        bullish = (
-            ema_fast > ema_slow
-            and price > ema_slow
-            and price > ema_trend
-            and slope_long_ok
-            and breakout_long_ok
-            and htf_long_ok
-            and candle_long_ok
-            and rsi_long_ok
-        )
-        bearish = (
-            ema_fast < ema_slow
-            and price < ema_slow
-            and price < ema_trend
-            and slope_short_ok
-            and breakout_short_ok
-            and htf_short_ok
-            and candle_short_ok
-            and rsi_short_ok
-        )
+        long_ok = price > ema200 and ema200 > ema200_10 and price > hh24_prev
+        short_ok = price < ema200 and ema200 < ema200_10 and price < ll24_prev
+        bullish = long_ok
+        bearish = short_ok
         if bullish:
             if explain:
-                parts = [
-                    f"LONG: ema_fast({self.settings.fast_ema}) {ema_fast:.6f}>ema_slow({self.settings.slow_ema}) {ema_slow:.6f}",
-                    f"price {price:.6f}>ema_trend {ema_trend:.6f}",
-                ]
-                if self.settings.rsi_filter:
-                    parts.append(f"rsi {rsi:.2f}>={self.settings.rsi_long}")
-                if self.settings.slope_filter:
-                    parts.append(f"slope {slope:.6f}>0")
-                if self.settings.ema_gap_filter:
-                    parts.append(f"ema_gap {abs(ema_fast - ema_slow):.6f}>={price * self.settings.ema_gap_min_pct:.6f}")
-                if self.settings.breakout_enabled:
-                    parts.append(f"breakout={hh_break}")
-                if self.settings.volume_filter:
-                    parts.append(f"vol x{vol/vol_sma:.2f}>={self.settings.vol_min_mult}")
-                if self.settings.atr_vol_filter:
-                    parts.append(f"atr_pct {atr_pct:.5f}>={self.settings.atr_vol_min_pct}")
-                if self.settings.candle_bias_filter:
-                    parts.append(f"close>open {price>open_price}, close>prev_close {price>prev_close}")
-                if self.settings.htf_bias_filter:
-                    parts.append(f"htf_bias {self.htf_trend is None or price > self.htf_trend}")
-                reason = ", ".join(parts)
+                reason = (
+                    f"LONG: close {price:.6f}>ema200 {ema200:.6f}, "
+                    f"ema200>ema200_10 {ema200_10:.6f}, "
+                    f"close {price:.6f}>hh24_prev {hh24_prev:.6f}"
+                )
             return 1, reason
         if bearish:
             if explain:
-                parts = [
-                    f"SHORT: ema_fast({self.settings.fast_ema}) {ema_fast:.6f}<ema_slow({self.settings.slow_ema}) {ema_slow:.6f}",
-                    f"price {price:.6f}<ema_trend {ema_trend:.6f}",
-                ]
-                if self.settings.rsi_filter:
-                    parts.append(f"rsi {rsi:.2f}<={self.settings.rsi_short}")
-                if self.settings.slope_filter:
-                    parts.append(f"slope {slope:.6f}<0")
-                if self.settings.ema_gap_filter:
-                    parts.append(f"ema_gap {abs(ema_fast - ema_slow):.6f}>={price * self.settings.ema_gap_min_pct:.6f}")
-                if self.settings.breakout_enabled:
-                    parts.append(f"breakout={ll_break}")
-                if self.settings.volume_filter:
-                    parts.append(f"vol x{vol/vol_sma:.2f}>={self.settings.vol_min_mult}")
-                if self.settings.atr_vol_filter:
-                    parts.append(f"atr_pct {atr_pct:.5f}>={self.settings.atr_vol_min_pct}")
-                if self.settings.candle_bias_filter:
-                    parts.append(f"close<open {price < open_price}, close<prev_close {price < prev_close}")
-                if self.settings.htf_bias_filter:
-                    parts.append(f"htf_bias {self.htf_trend is None or price < self.htf_trend}")
-                reason = ", ".join(parts)
+                reason = (
+                    f"SHORT: close {price:.6f}<ema200 {ema200:.6f}, "
+                    f"ema200<ema200_10 {ema200_10:.6f}, "
+                    f"close {price:.6f}<ll24_prev {ll24_prev:.6f}"
+                )
             return -1, reason
         return 0, "conditions not aligned" if explain else None
 
@@ -321,49 +216,34 @@ class FuturesBot:
             print(f"[warn] leverage change failed: {exc}")
 
     def _size_position(
-        self, direction: int, price: float, atr: float, equity_override: float | None = None
-    ) -> Tuple[float, float, float]:
-        stop_distance = self.settings.atr_multiplier * atr
-        if stop_distance <= 0:
-            raise ValueError("ATR stop distance invalid")
-        tick = self.filters["tick_size"]
+        self,
+        direction: int,
+        entry: float,
+        stop_price: float,
+        equity_override: float | None = None,
+    ) -> Tuple[float, float]:
+        risk_distance = abs(entry - stop_price)
+        if risk_distance <= 0:
+            raise ValueError("Stop equals entry; risk distance invalid")
         equity = equity_override if equity_override is not None else self._account_equity()
         risk_amount = equity * self.settings.risk_pct
-        raw_qty = risk_amount / stop_distance
+        raw_qty = risk_amount / risk_distance
         qty = max(raw_qty, self.filters["min_qty"])
         qty = max(self._round_to(qty, self.filters["step_size"]), self.filters["min_qty"])
-        notional = qty * price
+        notional = qty * entry
         if notional < self.filters["min_notional"]:
-            min_qty = self.filters["min_notional"] / price
+            min_qty = self.filters["min_notional"] / entry
             qty = self._round_to(max(min_qty, self.filters["min_qty"]), self.filters["step_size"])
-            notional = qty * price
+            notional = qty * entry
         if self.settings.max_notional and notional > self.settings.max_notional:
-            capped_qty = self._round_to(self.settings.max_notional / price, self.filters["step_size"])
+            capped_qty = self._round_to(self.settings.max_notional / entry, self.filters["step_size"])
             qty = max(capped_qty, self.filters["min_qty"])
-            notional = qty * price
+            notional = qty * entry
             if notional < self.filters["min_notional"]:
                 raise ValueError("max_notional is below exchange minimum notional; increase it")
         if qty <= 0:
             raise ValueError("Quantity computed as zero; check filters and price")
-        stop_price = price - stop_distance if direction > 0 else price + stop_distance
-        stop_price = max(stop_price, 0.0001)
-        stop_price = self._round_to(stop_price, tick)
-        if direction > 0 and stop_price >= price:
-            stop_price = max(self._round_to(price - tick, tick), 0.0001)
-        elif direction < 0 and stop_price <= price:
-            stop_price = self._round_to(price + tick, tick)
-
-        tp_distance = stop_distance * self.settings.take_profit_rr
-        tp_price = price + tp_distance if direction > 0 else price - tp_distance
-        tp_price = max(tp_price, 0.0001)
-        tp_price = self._round_to(tp_price, tick)
-
-        if direction > 0 and tp_price <= price:
-            tp_price = self._round_to(price + tick, tick)
-        elif direction < 0 and tp_price >= price:
-            tp_price = max(self._round_to(price - tick, tick), 0.0001)
-
-        return qty, stop_price, tp_price
+        return qty, notional
 
     def _has_open_position(self) -> bool:
         positions = self.client.position_information(symbol=self.settings.symbol)
@@ -404,49 +284,6 @@ class FuturesBot:
         )
         print(f"[live] stop set id: {stop_order.get('orderId')}")
         effective_entry = float(order.get("avgPrice") or price)
-        stop_distance = abs(effective_entry - stop_price)
-        # Optional partial take-profit at partial_tp_rr
-        if self.settings.partial_tp_enabled and 0 < self.settings.partial_tp_ratio < 1:
-            ptp_price = effective_entry + direction * stop_distance * self.settings.partial_tp_rr
-            ptp_order = self.client.new_order(
-                symbol=self.settings.symbol,
-                side=exit_side,
-                type="TAKE_PROFIT_MARKET",
-                stopPrice=str(ptp_price),
-                quantity=str(qty * self.settings.partial_tp_ratio),
-                reduceOnly="true",
-                workingType="MARK_PRICE",
-            )
-            print(f"[live] partial TP set id: {ptp_order.get('orderId')} qty={qty * self.settings.partial_tp_ratio} @ {ptp_price}")
-        # Break-even exit using TP-MARKET so it triggers in profit direction
-        if self.settings.break_even_rr > 0:
-            be_price = effective_entry + direction * stop_distance * self.settings.break_even_rr
-            be_order = self.client.new_order(
-                symbol=self.settings.symbol,
-                side=exit_side,
-                type="TAKE_PROFIT_MARKET",
-                stopPrice=str(be_price),
-                closePosition="true",
-                workingType="MARK_PRICE",
-            )
-            print(f"[live] break-even set id: {be_order.get('orderId')} @ {be_price}")
-        # Trailing stop once price moves in our favor
-        if self.settings.trailing_start_rr > 0 and self.settings.trailing_callback_pct > 0:
-            activation = effective_entry + direction * stop_distance * self.settings.trailing_start_rr
-            callback = max(min(self.settings.trailing_callback_pct, 5), 0.1)
-            trail_order = self.client.new_order(
-                symbol=self.settings.symbol,
-                side=exit_side,
-                type="TRAILING_STOP_MARKET",
-                activationPrice=str(activation),
-                callbackRate=str(callback),
-                closePosition="true",
-                workingType="MARK_PRICE",
-            )
-            print(
-                f"[live] trailing stop id: {trail_order.get('orderId')} activation={activation} "
-                f"callback={callback}%"
-            )
         tp_order = self.client.new_order(
             symbol=self.settings.symbol,
             side=exit_side,
@@ -457,9 +294,24 @@ class FuturesBot:
         )
         print(f"[live] take-profit set id: {tp_order.get('orderId')}")
 
+    def _build_orders(
+        self, direction: int, price: float, atr: float
+    ) -> Tuple[float, float, float]:
+        tick = self.filters["tick_size"]
+        stop_distance = self.settings.stop_atr_mult * atr
+        raw_stop = price - stop_distance if direction > 0 else price + stop_distance
+        stop_price = self._round_to(max(raw_stop, 0.0001), tick)
+        if direction > 0 and stop_price >= price:
+            stop_price = self._round_to(max(price - tick, 0.0001), tick)
+        elif direction < 0 and stop_price <= price:
+            stop_price = self._round_to(price + tick, tick)
+        risk_dist = abs(price - stop_price)
+        tp_price = price + direction * (self.settings.tp_rr * risk_dist)
+        tp_price = self._round_to(max(tp_price, 0.0001), tick)
+        qty, _ = self._size_position(direction, price, stop_price)
+        return qty, stop_price, tp_price
+
     def run_once(self) -> None:
-        if self.settings.htf_interval:
-            self.htf_trend = self._fetch_htf_trend()
         klines = self.fetch_klines()
         with_indicators = self._compute_indicators(klines)
         direction, price, atr = self._latest_signal(with_indicators)
@@ -473,14 +325,11 @@ class FuturesBot:
         if self._has_open_position():
             print("[info] open position detected; skipping new entry")
             return
-        qty, stop_price, tp_price = self._size_position(direction, price, atr)
+        qty, stop_price, tp_price = self._build_orders(direction, price, atr)
         slippage_price = price * (1 + self.settings.max_slippage_pct * direction)
-        stop_distance = abs(price - stop_price)
         plan = (
             f"[plan] {self.settings.symbol} {('LONG' if direction>0 else 'SHORT')}, "
             f"qty={qty}, entry~{price:.4f}, stop={stop_price:.4f}, tp={tp_price:.4f}, "
-            f"be@{price + direction*stop_distance:.4f}, "
-            f"trail_start@{price + direction*(self.settings.trailing_start_rr*stop_distance):.4f}, "
             f"est.notional=${qty*price:.2f}"
         )
         print(plan)
@@ -497,7 +346,13 @@ class FuturesBot:
 def parse_settings() -> Settings:
     parser = argparse.ArgumentParser(description="Binance Futures bot (single cycle)")
     parser.add_argument("--symbol", default=os.getenv("BOT_SYMBOL", "DOGEUSDT"))
-    parser.add_argument("--interval", default=os.getenv("BOT_INTERVAL", "5m"))
+    parser.add_argument("--interval", default=os.getenv("BOT_INTERVAL", "1h"))
+    parser.add_argument(
+        "--lookback",
+        type=int,
+        default=int(os.getenv("BOT_LOOKBACK", "300")),
+        help="number of candles to fetch (pagination; Binance limit 1500 per call)",
+    )
     parser.add_argument("--live", action="store_true", help="execute live orders")
     parser.add_argument("--testnet", action="store_true", help="use Binance Futures testnet")
     args = parser.parse_args()
@@ -505,6 +360,7 @@ def parse_settings() -> Settings:
     return Settings(
         symbol=args.symbol.upper(),
         interval=args.interval,
+        lookback=args.lookback,
         testnet=args.testnet or testnet_env,
         live=args.live,
     )
