@@ -203,7 +203,7 @@ class FuturesBot:
 
     def _order_trades(self, order_id: int) -> List[dict]:
         try:
-            trades = self.client.user_trades(symbol=self.settings.symbol, orderId=order_id)
+            trades = self.client.get_account_trades(symbol=self.settings.symbol, orderId=order_id)
         except ClientError:
             return []
         return trades or []
@@ -233,7 +233,7 @@ class FuturesBot:
         reason = None
         def _order_status(oid: int) -> str:
             try:
-                res = self.client.get_order(symbol=self.settings.symbol, orderId=oid)
+                res = self.client.query_order(symbol=self.settings.symbol, orderId=oid)
                 return res.get("status", "")
             except ClientError:
                 return ""
@@ -339,6 +339,10 @@ class FuturesBot:
         precision = max(int(round(-math.log(step, 10))) if step < 1 else 0, 0)
         return round(math.floor(value / step) * step, precision)
 
+    def _round_up_to(self, value: float, step: float) -> float:
+        precision = max(int(round(-math.log(step, 10))) if step < 1 else 0, 0)
+        return round(math.ceil(value / step) * step, precision)
+
     def _account_equity(self) -> float:
         balances = self.client.balance()
         usdt = next((b for b in balances if b["asset"] == "USDT"), None)
@@ -374,7 +378,7 @@ class FuturesBot:
         notional = qty * entry
         if notional < self.filters["min_notional"]:
             min_qty = self.filters["min_notional"] / entry
-            qty = self._round_to(max(min_qty, self.filters["min_qty"]), self.filters["step_size"])
+            qty = self._round_up_to(max(min_qty, self.filters["min_qty"]), self.filters["step_size"])
             notional = qty * entry
         if self.settings.max_notional and notional > self.settings.max_notional:
             capped_qty = self._round_to(self.settings.max_notional / entry, self.filters["step_size"])
@@ -387,7 +391,7 @@ class FuturesBot:
         return qty, notional
 
     def _has_open_position(self) -> bool:
-        positions = self.client.position_information(symbol=self.settings.symbol)
+        positions = self.client.get_position_risk(symbol=self.settings.symbol)
         for pos in positions:
             pos_amt = float(pos.get("positionAmt", 0))
             if abs(pos_amt) > 0:
@@ -421,8 +425,8 @@ class FuturesBot:
             side=exit_side,
             type="STOP_MARKET",
             stopPrice=str(stop_price),
-            closePosition="true",
-            workingType="MARK_PRICE",
+            quantity=str(qty),
+            reduceOnly="true",
         )
         print(f"[live] stop set id: {stop_order.get('orderId')}")
         effective_entry = float(order.get("avgPrice") or price)
@@ -431,8 +435,8 @@ class FuturesBot:
             side=exit_side,
             type="TAKE_PROFIT_MARKET",
             stopPrice=str(tp_price),
-            closePosition="true",
-            workingType="MARK_PRICE",
+            quantity=str(qty),
+            reduceOnly="true",
         )
         print(f"[live] take-profit set id: {tp_order.get('orderId')}")
         stop_order_id = int(stop_order.get("orderId"))
