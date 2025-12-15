@@ -420,24 +420,60 @@ class FuturesBot:
         )
         print(f"[live] entry order id: {order.get('orderId')}")
         entry_order_id = int(order.get("orderId"))
-        stop_order = self.client.new_order(
-            symbol=self.settings.symbol,
-            side=exit_side,
-            type="STOP_MARKET",
-            stopPrice=str(stop_price),
-            quantity=str(qty),
-            reduceOnly="true",
-        )
+        try:
+            stop_order = self.client.new_order(
+                symbol=self.settings.symbol,
+                side=exit_side,
+                type="STOP_MARKET",
+                stopPrice=str(stop_price),
+                quantity=str(qty),
+                reduceOnly="true",
+            )
+        except ClientError as exc:
+            if "algo order" in exc.error_message.lower() or "order type not supported" in exc.error_message.lower():
+                print(
+                    f"[warn] STOP_MARKET rejected ({exc.error_message}); retrying as STOP (stop-limit)"
+                )
+                stop_order = self.client.new_order(
+                    symbol=self.settings.symbol,
+                    side=exit_side,
+                    type="STOP",
+                    timeInForce="GTC",
+                    stopPrice=str(stop_price),
+                    price=str(stop_price),
+                    quantity=str(qty),
+                    reduceOnly="true",
+                )
+            else:
+                raise
         print(f"[live] stop set id: {stop_order.get('orderId')}")
         effective_entry = float(order.get("avgPrice") or price)
-        tp_order = self.client.new_order(
-            symbol=self.settings.symbol,
-            side=exit_side,
-            type="TAKE_PROFIT_MARKET",
-            stopPrice=str(tp_price),
-            quantity=str(qty),
-            reduceOnly="true",
-        )
+        try:
+            tp_order = self.client.new_order(
+                symbol=self.settings.symbol,
+                side=exit_side,
+                type="TAKE_PROFIT_MARKET",
+                stopPrice=str(tp_price),
+                quantity=str(qty),
+                reduceOnly="true",
+            )
+        except ClientError as exc:
+            if "algo order" in exc.error_message.lower() or "order type not supported" in exc.error_message.lower():
+                print(
+                    f"[warn] TAKE_PROFIT_MARKET rejected ({exc.error_message}); retrying as TAKE_PROFIT (stop-limit)"
+                )
+                tp_order = self.client.new_order(
+                    symbol=self.settings.symbol,
+                    side=exit_side,
+                    type="TAKE_PROFIT",
+                    timeInForce="GTC",
+                    stopPrice=str(tp_price),
+                    price=str(tp_price),
+                    quantity=str(qty),
+                    reduceOnly="true",
+                )
+            else:
+                raise
         print(f"[live] take-profit set id: {tp_order.get('orderId')}")
         stop_order_id = int(stop_order.get("orderId"))
         tp_order_id = int(tp_order.get("orderId"))
