@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import pandas as pd
+import requests
+import urllib3
 from binance.error import ClientError
 from binance.um_futures import UMFutures
 from dotenv import load_dotenv
@@ -35,6 +37,9 @@ class Settings:
     loop: bool = False
     poll_seconds: int = 300
     live_log: str = "reports/live_trades.csv"
+    api_retries: int = 3
+    api_retry_backoff: float = 2.0
+    api_timeout: float = 10.0
 
 
 class FuturesBot:
@@ -45,14 +50,35 @@ class FuturesBot:
             base_url = "https://testnet.binancefuture.com"
         if not base_url:
             base_url = "https://fapi.binance.com"
-        self.client = UMFutures(key=api_key, secret=api_secret, base_url=base_url)
+        self.client = UMFutures(
+            key=api_key,
+            secret=api_secret,
+            base_url=base_url,
+            timeout=settings.api_timeout,
+        )
         self.filters = self._fetch_filters(settings.symbol)
         self._live_state: dict | None = None
         self._equity_cache: float | None = None
         os.makedirs(os.path.dirname(self.settings.live_log) or ".", exist_ok=True)
 
+    def _call_with_retries(self, func, *args, **kwargs):
+        attempts = max(1, int(self.settings.api_retries))
+        backoff = max(0.0, float(self.settings.api_retry_backoff))
+        for attempt in range(1, attempts + 1):
+            try:
+                return func(*args, **kwargs)
+            except (requests.exceptions.RequestException, urllib3.exceptions.ProtocolError) as exc:
+                if attempt >= attempts:
+                    raise
+                delay = backoff ** (attempt - 1)
+                delay = min(delay, 30.0)
+                print(
+                    f"[warn] API call failed ({exc}); retry {attempt}/{attempts} in {delay:.1f}s"
+                )
+                time.sleep(delay)
+
     def _fetch_filters(self, symbol: str) -> Dict[str, float]:
-        info = self.client.exchange_info()
+        info = self._call_with_retries(self.client.exchange_info)
         match = next((s for s in info["symbols"] if s["symbol"] == symbol), None)
         if not match:
             raise ValueError(f"Symbol {symbol} not found on exchange")
@@ -84,7 +110,11 @@ class FuturesBot:
             }
             if end_time is not None:
                 params["endTime"] = end_time
-            batch = self.client.klines(**params)
+            try:
+                batch = self._call_with_retries(self.client.klines, **params)
+            except Exception as exc:
+                print(f"[error] failed to fetch klines after retries: {exc}")
+                break
             if not batch:
                 break
             rows.extend(batch)
@@ -514,6 +544,9 @@ class FuturesBot:
     def run_once(self) -> None:
         self._process_live_exit()
         klines = self.fetch_klines()
+        if klines.empty:
+            print("[error] no klines fetched; skipping cycle")
+            return
         with_indicators = self._compute_indicators(klines)
         direction, price, atr = self._latest_signal(with_indicators)
         print(
@@ -574,6 +607,24 @@ def parse_settings() -> Settings:
         default=os.getenv("BOT_LIVE_LOG", "reports/live_trades.csv"),
         help="CSV path to append live trade logs",
     )
+    parser.add_argument(
+        "--api-timeout",
+        type=float,
+        default=float(os.getenv("BOT_API_TIMEOUT", "10")),
+        help="HTTP timeout (seconds) for Binance requests",
+    )
+    parser.add_argument(
+        "--api-retries",
+        type=int,
+        default=int(os.getenv("BOT_API_RETRIES", "3")),
+        help="Retries for recoverable Binance HTTP errors",
+    )
+    parser.add_argument(
+        "--api-retry-backoff",
+        type=float,
+        default=float(os.getenv("BOT_API_RETRY_BACKOFF", "2.0")),
+        help="Exponential backoff base (seconds) between retries",
+    )
     args = parser.parse_args()
     testnet_env = os.getenv("BINANCE_TESTNET", "0") == "1"
     return Settings(
@@ -585,6 +636,9 @@ def parse_settings() -> Settings:
         loop=args.loop,
         poll_seconds=max(1, args.sleep),
         live_log=args.live_log,
+        api_timeout=args.api_timeout,
+        api_retries=args.api_retries,
+        api_retry_backoff=args.api_retry_backoff,
     )
 
 
