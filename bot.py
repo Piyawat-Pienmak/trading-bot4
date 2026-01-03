@@ -40,6 +40,7 @@ class Settings:
     api_retries: int = 3
     api_retry_backoff: float = 2.0
     api_timeout: float = 10.0
+    log_flat: bool = False
 
 
 class FuturesBot:
@@ -487,17 +488,12 @@ class FuturesBot:
     ) -> dict:
         side = "BUY" if direction > 0 else "SELL"
         exit_side = "SELL" if direction > 0 else "BUY"
-        print(
-            f"[live] submitting market {side} {qty} {self.settings.symbol} @ ~{price}, "
-            f"stop {stop_price}, tp {tp_price}"
-        )
         order = self.client.new_order(
             symbol=self.settings.symbol,
             side=side,
             type="MARKET",
             quantity=str(qty),
         )
-        print(f"[live] entry order id: {order.get('orderId')}")
         entry_order_id = int(order.get("orderId"))
         try:
             stop_order = self.client.new_order(
@@ -525,7 +521,6 @@ class FuturesBot:
                 )
             else:
                 raise
-        print(f"[live] stop set id: {stop_order.get('orderId')}")
         effective_entry = float(order.get("avgPrice") or price)
         try:
             tp_order = self.client.new_order(
@@ -553,7 +548,6 @@ class FuturesBot:
                 )
             else:
                 raise
-        print(f"[live] take-profit set id: {tp_order.get('orderId')}")
         stop_order_id = int(stop_order.get("orderId"))
         tp_order_id = int(tp_order.get("orderId"))
         trades = self._order_trades(entry_order_id)
@@ -590,44 +584,76 @@ class FuturesBot:
         qty, _ = self._size_position(direction, price, stop_price)
         return qty, stop_price, tp_price
 
-    def run_once(self) -> None:
+    def run_once(self, cycle: int, timestamp: str, sleep_for: int | None = None) -> bool:
         self._process_live_exit()
         klines = self.fetch_klines()
         if klines.empty:
-            print("[error] no klines fetched; skipping cycle")
-            return
+            print(f"[cycle] {cycle} @ {timestamp} [error] no klines fetched; skipping cycle")
+            return False
         with_indicators = self._compute_indicators(klines)
-        if self._maybe_exit_on_ema_break(with_indicators):
-            return
         direction, price, atr = self._latest_signal(with_indicators)
-        print(
-            f"[info] signal: {'LONG' if direction>0 else 'SHORT' if direction<0 else 'FLAT'} "
-            f"price={price:.4f} atr={atr:.4f}"
-        )
+        last = with_indicators.iloc[-1]
+        ema200 = float(last["ema200"])
+        ema200_10 = float(last.get("ema200_10", float("nan")))
+        if self._maybe_exit_on_ema_break(with_indicators):
+            print(f"[cycle] {cycle} @ {timestamp}")
+            return False
+        stop_price = float("nan")
+        tp_price = float("nan")
+        has_position = False
+        if direction != 0:
+            has_position = self._has_open_position()
+            if not has_position:
+                qty, stop_price, tp_price = self._build_orders(direction, price, atr)
+        signal_label = "LONG" if direction > 0 else "SHORT" if direction < 0 else "FLAT"
         if direction == 0:
-            print("[info] no trade signal; exiting")
-            return
-        if self._has_open_position():
+            if self.settings.log_flat:
+                line = (
+                    f"[cycle] {cycle} @ {timestamp} "
+                    f"signal={signal_label} price={price:.4f} atr={atr:.4f} "
+                    f"ema200={ema200:.4f} ema200_10={ema200_10:.4f} "
+                    f"sl={stop_price:.4f} tp={tp_price:.4f}"
+                )
+                if sleep_for is not None:
+                    line += f" sleep={sleep_for}s"
+                print(line)
+                return True
+            return False
+        print(f"\n[cycle] {cycle} @ {timestamp}")
+        if not self.settings.live:
+            print(
+                f"[live] signal={signal_label} price={price:.4f} atr={atr:.4f} "
+                f"ema200={ema200:.4f} ema200_10={ema200_10:.4f} "
+                f"sl={stop_price:.4f} tp={tp_price:.4f}"
+            )
+        if has_position:
             print("[info] open position detected; skipping new entry")
-            return
-        qty, stop_price, tp_price = self._build_orders(direction, price, atr)
+            return False
         slippage_price = price * (1 + self.settings.max_slippage_pct * direction)
         plan = (
             f"[plan] {self.settings.symbol} {('LONG' if direction>0 else 'SHORT')}, "
             f"qty={qty}, entry~{price:.4f}, stop={stop_price:.4f}, tp={tp_price:.4f}, "
             f"est.notional=${qty*price:.2f}"
         )
-        print(plan)
         if not self.settings.live:
+            print(plan)
             print("[dry-run] pass --live to send orders")
-            return
+            return False
         self._ensure_leverage()
         try:
             state = self._place_orders(direction, qty, stop_price, tp_price, slippage_price)
             self._live_state = state
-            print(f"[live] entry logged at {state['entry_price']:.6f}, waiting for exit")
+            print(
+                f"[cycle] {cycle} @ {timestamp} "
+                f"signal={signal_label} price={price:.4f} atr={atr:.4f} "
+                f"ema200={ema200:.4f} ema200_10={ema200_10:.4f} "
+                f"sl={stop_price:.4f} tp={tp_price:.4f} qty={qty} "
+                f"entry_id={state['entry_order_id']} stop_id={state['stop_order_id']} "
+                f"tp_id={state['tp_order_id']} entry={state['entry_price']:.6f}"
+            )
         except ClientError as exc:
             print(f"[error] order failed: {exc.error_message}")
+        return False
 
 
 def parse_settings() -> Settings:
@@ -676,6 +702,11 @@ def parse_settings() -> Settings:
         default=float(os.getenv("BOT_API_RETRY_BACKOFF", "2.0")),
         help="Exponential backoff base (seconds) between retries",
     )
+    parser.add_argument(
+        "--log-flat",
+        action="store_true",
+        help="log one-line output when signal is FLAT",
+    )
     args = parser.parse_args()
     testnet_env = os.getenv("BINANCE_TESTNET", "0") == "1"
     return Settings(
@@ -690,6 +721,7 @@ def parse_settings() -> Settings:
         api_timeout=args.api_timeout,
         api_retries=args.api_retries,
         api_retry_backoff=args.api_retry_backoff,
+        log_flat=args.log_flat,
     )
 
 
@@ -704,13 +736,15 @@ def main() -> None:
     try:
         while True:
             cycle += 1
-            print(f"\n[cycle] {cycle} @ {pd.Timestamp.utcnow().isoformat()}Z")
-            bot.run_once()
+            timestamp = f"{pd.Timestamp.utcnow().isoformat()}Z"
+            sleep_for = max(1, settings.poll_seconds) if settings.loop else None
+            flat_logged = bot.run_once(cycle, timestamp, sleep_for)
             if not settings.loop:
                 break
-            sleep_for = max(1, settings.poll_seconds)
-            print(f"[sleep] waiting {sleep_for}s before next check")
-            time.sleep(sleep_for)
+            if settings.log_flat and not flat_logged and sleep_for is not None:
+                print(f"[sleep] waiting {sleep_for}s before next check")
+            if sleep_for is not None:
+                time.sleep(sleep_for)
     except KeyboardInterrupt:
         print("\n[info] interrupted by user; exiting")
 
