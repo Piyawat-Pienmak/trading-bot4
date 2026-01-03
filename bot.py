@@ -281,6 +281,11 @@ class FuturesBot:
             return
         trades = self._order_trades(filled_id)
         exit_price, exit_fee = self._trades_avg_price_and_fee(trades)
+        self._log_live_exit(exit_price, exit_fee, reason or "")
+
+    def _log_live_exit(self, exit_price: float, exit_fee: float, reason: str) -> None:
+        if not self._live_state:
+            return
         direction = self._live_state.get("direction", "")
         entry_price = float(self._live_state.get("entry_price", 0.0) or 0.0)
         entry_fee = float(self._live_state.get("entry_fee", 0.0) or 0.0)
@@ -311,6 +316,47 @@ class FuturesBot:
         )
         print(f"[live] exit detected ({reason}); logged trade with net PnL {net_pnl:.6f}")
         self._live_state = None
+
+    def _maybe_exit_on_ema_break(self, df: pd.DataFrame) -> bool:
+        if not self.settings.live or not self._live_state:
+            return False
+        last = df.iloc[-1]
+        ema200 = float(last.get("ema200", float("nan")))
+        close = float(last.get("close", float("nan")))
+        if math.isnan(ema200) or math.isnan(close):
+            return False
+        direction = self._live_state.get("direction", "")
+        exit_long = direction == "long" and close < ema200
+        exit_short = direction == "short" and close > ema200
+        if not (exit_long or exit_short):
+            return False
+        qty = abs(self._position_amt())
+        if qty <= 0:
+            return False
+        try:
+            self.client.cancel_open_orders(symbol=self.settings.symbol)
+        except (ClientError, AttributeError) as exc:
+            msg = getattr(exc, "error_message", str(exc))
+            print(f"[warn] cancel_open_orders failed: {msg}")
+        exit_side = "SELL" if direction == "long" else "BUY"
+        try:
+            order = self.client.new_order(
+                symbol=self.settings.symbol,
+                side=exit_side,
+                type="MARKET",
+                quantity=str(qty),
+                reduceOnly="true",
+            )
+        except ClientError as exc:
+            print(f"[error] EMA exit order failed: {exc.error_message}")
+            return False
+        exit_order_id = int(order.get("orderId"))
+        trades = self._order_trades(exit_order_id)
+        exit_price, exit_fee = self._trades_avg_price_and_fee(trades)
+        if exit_price <= 0:
+            exit_price = float(order.get("avgPrice") or close)
+        self._log_live_exit(exit_price, exit_fee, "EMA_break")
+        return True
 
     def _wallet_equity(self) -> float:
         balances = self.client.balance()
@@ -421,12 +467,15 @@ class FuturesBot:
         return qty, notional
 
     def _has_open_position(self) -> bool:
+        return abs(self._position_amt()) > 0
+
+    def _position_amt(self) -> float:
         positions = self.client.get_position_risk(symbol=self.settings.symbol)
         for pos in positions:
             pos_amt = float(pos.get("positionAmt", 0))
             if abs(pos_amt) > 0:
-                return True
-        return False
+                return pos_amt
+        return 0.0
 
     def _place_orders(
         self,
@@ -548,6 +597,8 @@ class FuturesBot:
             print("[error] no klines fetched; skipping cycle")
             return
         with_indicators = self._compute_indicators(klines)
+        if self._maybe_exit_on_ema_break(with_indicators):
+            return
         direction, price, atr = self._latest_signal(with_indicators)
         print(
             f"[info] signal: {'LONG' if direction>0 else 'SHORT' if direction<0 else 'FLAT'} "
