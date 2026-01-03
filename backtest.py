@@ -310,7 +310,7 @@ def run_all(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Multi-strategy backtester")
     parser.add_argument("--symbol", default=os.getenv("BOT_SYMBOL", "DOGEUSDT"))
-    parser.add_argument("--interval", default=os.getenv("BOT_INTERVAL", "1h"))
+    parser.add_argument("--interval", default=os.getenv("BOT_INTERVAL", "4h"))
     parser.add_argument("--lookback", type=int, default=500)
     parser.add_argument("--initial", type=float, default=25.0, help="starting equity")
     parser.add_argument("--risk-pct", type=float, default=0.03, help="fraction of equity to risk per trade")
