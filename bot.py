@@ -12,6 +12,7 @@ from binance.error import ClientError
 from binance.um_futures import UMFutures
 from dotenv import load_dotenv
 
+from strategies.indicators import atr as atr_calc
 
 load_dotenv()
 
@@ -159,12 +160,7 @@ class FuturesBot:
         df = df.copy()
         df["ema200"] = df["close"].ewm(span=self.settings.ema_period, adjust=False).mean()
         df["ema200_10"] = df["ema200"].shift(10)
-        df["high_low"] = df["high"] - df["low"]
-        df["prev_close"] = df["close"].shift(1)
-        df["high_close"] = (df["high"] - df["prev_close"]).abs()
-        df["low_close"] = (df["low"] - df["prev_close"]).abs()
-        df["tr"] = df[["high_low", "high_close", "low_close"]].max(axis=1)
-        df["atr"] = df["tr"].rolling(window=self.settings.atr_period, min_periods=1).mean()
+        df["atr"] = atr_calc(df, self.settings.atr_period)
         df["hh24_prev"] = (
             df["high"]
             .rolling(window=self.settings.breakout_lookback, min_periods=self.settings.breakout_lookback)
