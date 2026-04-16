@@ -1,4 +1,5 @@
 import argparse
+import csv
 import math
 import os
 import time
@@ -13,6 +14,76 @@ from binance.um_futures import UMFutures
 from dotenv import load_dotenv
 
 load_dotenv()
+
+TRADE_LOG_HEADERS = [
+    "trade_id",
+    "strategy_name",
+    "strategy_version",
+    "symbol",
+    "interval",
+    "side",
+    "entry_signal_time",
+    "entry_exec_time",
+    "exit_signal_time",
+    "exit_exec_time",
+    "entry_reason",
+    "exit_reason",
+    "market_regime",
+    "signal_open",
+    "signal_high",
+    "signal_low",
+    "signal_close",
+    "entry_price_expected",
+    "entry_price_filled",
+    "exit_price_expected",
+    "exit_price_filled",
+    "position_size",
+    "notional_usdt",
+    "leverage",
+    "stop_loss_price",
+    "take_profit_price",
+    "trailing_stop_price",
+    "ema_value",
+    "atr_value",
+    "adx_value",
+    "volume",
+    "volume_ma",
+    "breakout_level",
+    "zscore",
+    "fee_entry",
+    "fee_exit",
+    "slippage_entry",
+    "slippage_exit",
+    "max_unrealized_profit",
+    "max_unrealized_loss",
+    "max_favorable_excursion",
+    "max_adverse_excursion",
+    "gross_pnl",
+    "net_pnl",
+    "r_multiple",
+    "bars_held",
+    "signal_valid",
+    "missed_trade",
+    "wrong_trade",
+    "exchange_error",
+    "data_error",
+    "server_error",
+    "manual_intervention",
+    "notes",
+]
+
+EVENT_LOG_HEADERS = [
+    "event_time",
+    "trade_id",
+    "event_type",
+    "symbol",
+    "side",
+    "price",
+    "details",
+]
+
+DEFAULT_STRATEGY_NAME = "range_mean_reversion"
+DEFAULT_STRATEGY_VERSION = "1"
 
 
 def _true_range(data: pd.DataFrame) -> pd.Series:
@@ -100,7 +171,12 @@ class Settings:
     base_url: str | None = None
     loop: bool = False
     poll_seconds: int = 300
-    live_log: str = "reports/live_trades.csv"
+    trade_log: str = "reports/trade_log.csv"
+    event_log: str = "reports/event_log.csv"
+    trade_log_limit: int = 1000
+    event_log_limit: int = 1000
+    strategy_name: str = DEFAULT_STRATEGY_NAME
+    strategy_version: str = DEFAULT_STRATEGY_VERSION
     api_retries: int = 3
     api_retry_backoff: float = 2.0
     api_timeout: float = 10.0
@@ -125,7 +201,8 @@ class FuturesBot:
         self._live_state: dict | None = None
         self._equity_cache: float | None = None
         self._cooldown_left = 0
-        os.makedirs(os.path.dirname(self.settings.live_log) or ".", exist_ok=True)
+        for path in (self.settings.trade_log, self.settings.event_log):
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
     def _call_with_retries(self, func, *args, **kwargs):
         attempts = max(1, int(self.settings.api_retries))
@@ -134,6 +211,10 @@ class FuturesBot:
             try:
                 return func(*args, **kwargs)
             except (requests.exceptions.RequestException, urllib3.exceptions.ProtocolError) as exc:
+                if self._live_state:
+                    note = f"{getattr(func, '__name__', 'api_call')} failed: {exc}"
+                    self._mark_live_flag("server_error", note)
+                    self._log_event("server_error", note)
                 if attempt >= attempts:
                     raise
                 delay = backoff ** (attempt - 1)
@@ -179,6 +260,10 @@ class FuturesBot:
             try:
                 batch = self._call_with_retries(self.client.klines, **params)
             except Exception as exc:
+                if self._live_state:
+                    note = f"failed to fetch klines after retries: {exc}"
+                    self._mark_live_flag("data_error", note)
+                    self._log_event("data_error", note)
                 print(f"[error] failed to fetch klines after retries: {exc}")
                 break
             if not batch:
@@ -415,6 +500,135 @@ class FuturesBot:
             return 0, f"{side} candidate rejected by regime filter: {reject_reasons}"
         return 0, "conditions not aligned" if explain else None
 
+    @staticmethod
+    def _utc_now_iso() -> str:
+        return pd.Timestamp.utcnow().isoformat()
+
+    @staticmethod
+    def _iso_from_ms(value: float | int | None) -> str:
+        if value in (None, ""):
+            return ""
+        try:
+            return pd.to_datetime(float(value), unit="ms", utc=True).isoformat()
+        except (TypeError, ValueError):
+            return ""
+
+    @staticmethod
+    def _csv_value(value: object) -> object:
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            return ""
+        try:
+            if pd.isna(value):
+                return ""
+        except TypeError:
+            pass
+        return value
+
+    def _append_capped_csv(
+        self,
+        path: str,
+        fieldnames: List[str],
+        row: Dict[str, object],
+        limit: int,
+    ) -> None:
+        rows: List[Dict[str, object]] = []
+        if os.path.exists(path):
+            with open(path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                if reader.fieldnames:
+                    for existing in reader:
+                        rows.append({name: existing.get(name, "") for name in fieldnames})
+        rows.append({name: self._csv_value(row.get(name, "")) for name in fieldnames})
+        if limit > 0:
+            rows = rows[-limit:]
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def _append_trade_note(self, note: str) -> None:
+        if not note or not self._live_state:
+            return
+        current = str(self._live_state.get("notes", "") or "")
+        self._live_state["notes"] = note if not current else f"{current} | {note}"
+
+    def _mark_live_flag(self, field_name: str, note: str = "") -> None:
+        if not self._live_state:
+            return
+        self._live_state[field_name] = 1
+        self._append_trade_note(note)
+
+    def _log_event(
+        self,
+        event_type: str,
+        details: str,
+        trade_id: str = "",
+        side: str = "",
+        price: float | None = None,
+        event_time: str = "",
+    ) -> None:
+        state = self._live_state or {}
+        resolved_side = side or str(state.get("side") or state.get("direction") or "")
+        resolved_side = resolved_side.upper()
+        price_value: object = ""
+        if price is not None and not math.isnan(price) and not math.isinf(price):
+            price_value = round(float(price), 8)
+        self._append_capped_csv(
+            self.settings.event_log,
+            EVENT_LOG_HEADERS,
+            {
+                "event_time": event_time or self._utc_now_iso(),
+                "trade_id": trade_id or str(state.get("trade_id", "") or ""),
+                "event_type": event_type,
+                "symbol": self.settings.symbol,
+                "side": resolved_side,
+                "price": price_value,
+                "details": details,
+            },
+            self.settings.event_log_limit,
+        )
+
+    def _update_live_trade_extremes(self, row: pd.Series) -> None:
+        if not self._live_state:
+            return
+        entry_price = float(self._live_state.get("entry_price", 0.0) or 0.0)
+        size = float(self._live_state.get("size", 0.0) or 0.0)
+        if entry_price <= 0 or size <= 0:
+            return
+        high = float(row.get("high", entry_price) or entry_price)
+        low = float(row.get("low", entry_price) or entry_price)
+        if math.isnan(high) or math.isnan(low):
+            return
+        direction = self._live_state.get("direction", "")
+        if direction == "long":
+            favorable_price = max(0.0, high - entry_price)
+            adverse_price = min(0.0, low - entry_price)
+        else:
+            favorable_price = max(0.0, entry_price - low)
+            adverse_price = min(0.0, entry_price - high)
+        favorable_pnl = favorable_price * size
+        adverse_pnl = adverse_price * size
+        self._live_state["max_favorable_excursion"] = max(
+            float(self._live_state.get("max_favorable_excursion", 0.0) or 0.0),
+            favorable_price,
+        )
+        self._live_state["max_adverse_excursion"] = min(
+            float(self._live_state.get("max_adverse_excursion", 0.0) or 0.0),
+            adverse_price,
+        )
+        self._live_state["max_unrealized_profit"] = max(
+            float(self._live_state.get("max_unrealized_profit", 0.0) or 0.0),
+            favorable_pnl,
+        )
+        self._live_state["max_unrealized_loss"] = min(
+            float(self._live_state.get("max_unrealized_loss", 0.0) or 0.0),
+            adverse_pnl,
+        )
+
     def _latest_signal(self, df: pd.DataFrame) -> Tuple[int, float, float]:
         last = df.iloc[-1]
         atr = float(last["atr"])
@@ -429,12 +643,13 @@ class FuturesBot:
             return []
         return trades or []
 
-    def _trades_avg_price_and_fee(self, trades: List[dict]) -> Tuple[float, float]:
+    def _trades_summary(self, trades: List[dict]) -> Tuple[float, float, str]:
         if not trades:
-            return 0.0, 0.0
+            return 0.0, 0.0, ""
         total_qty = 0.0
         total_quote = 0.0
         total_fee = 0.0
+        latest_trade_time = 0.0
         for t in trades:
             qty = float(t.get("qty", 0) or 0.0)
             price = float(t.get("price", 0) or 0.0)
@@ -442,8 +657,9 @@ class FuturesBot:
             total_qty += qty
             total_quote += qty * price
             total_fee += fee
+            latest_trade_time = max(latest_trade_time, float(t.get("time", 0) or 0.0))
         avg_price = (total_quote / total_qty) if total_qty > 0 else 0.0
-        return avg_price, total_fee
+        return avg_price, total_fee, self._iso_from_ms(latest_trade_time)
 
     def _process_live_exit(self) -> None:
         if not self.settings.live or not self._live_state:
@@ -452,12 +668,18 @@ class FuturesBot:
         tp_id = self._live_state.get("tp_order_id")
         filled_id = None
         reason = None
+
         def _order_status(oid: int) -> str:
             try:
                 res = self.client.query_order(symbol=self.settings.symbol, orderId=oid)
                 return res.get("status", "")
-            except ClientError:
+            except ClientError as exc:
+                msg = getattr(exc, "error_message", str(exc))
+                note = f"query_order failed for {oid}: {msg}"
+                self._mark_live_flag("exchange_error", note)
+                self._log_event("exchange_error", note)
                 return ""
+
         if stop_id:
             status = _order_status(stop_id)
             if status == "FILLED":
@@ -474,57 +696,152 @@ class FuturesBot:
             self.client.cancel_open_orders(symbol=self.settings.symbol)
         except (ClientError, AttributeError) as exc:
             msg = getattr(exc, "error_message", str(exc))
+            note = f"cancel_open_orders failed after exit: {msg}"
+            self._mark_live_flag("exchange_error", note)
+            self._log_event("exchange_error", note)
             print(f"[warn] cancel_open_orders failed after exit: {msg}")
         trades = self._order_trades(filled_id)
-        exit_price, exit_fee = self._trades_avg_price_and_fee(trades)
-        self._log_live_exit(exit_price, exit_fee, reason or "")
+        exit_price, exit_fee, exit_exec_time = self._trades_summary(trades)
+        expected_price = None
+        if reason == "hit_sl":
+            expected_price = float(self._live_state.get("sl_price", 0.0) or 0.0)
+        elif reason == "hit_tp":
+            expected_price = float(self._live_state.get("tp_price", 0.0) or 0.0)
+        self._log_live_exit(
+            exit_price,
+            exit_fee,
+            reason or "",
+            exit_exec_time=exit_exec_time,
+            exit_signal_time=exit_exec_time,
+            exit_expected_price=expected_price if expected_price and expected_price > 0 else None,
+        )
 
-    def _log_live_exit(self, exit_price: float, exit_fee: float, reason: str) -> None:
+    def _log_live_exit(
+        self,
+        exit_price: float,
+        exit_fee: float,
+        reason: str,
+        exit_exec_time: str = "",
+        exit_signal_time: str = "",
+        exit_expected_price: float | None = None,
+    ) -> None:
         if not self._live_state:
             return
-        direction = self._live_state.get("direction", "")
-        entry_price = float(self._live_state.get("entry_price", 0.0) or 0.0)
-        entry_fee = float(self._live_state.get("entry_fee", 0.0) or 0.0)
-        size = float(self._live_state.get("size", 0.0) or 0.0)
+        state = self._live_state
+        direction = state.get("direction", "")
+        entry_price = float(state.get("entry_price", 0.0) or 0.0)
+        entry_fee = float(state.get("entry_fee", 0.0) or 0.0)
+        size = float(state.get("size", 0.0) or 0.0)
         if exit_price <= 0:
             exit_price = entry_price
+        entry_expected_price = float(state.get("entry_price_expected", entry_price) or entry_price)
+        if exit_expected_price is None or exit_expected_price <= 0:
+            exit_expected_price = exit_price
         gross_pnl = (exit_price - entry_price) * size if direction == "long" else (entry_price - exit_price) * size
         fees = entry_fee + exit_fee
         net_pnl = gross_pnl - fees
+        risk_amount = abs(entry_price - float(state.get("sl_price", entry_price) or entry_price)) * size
+        entry_exec_ts = str(state.get("entry_exec_time", state.get("timestamp_entry", "")) or "")
+        exit_signal_ts = exit_signal_time or exit_exec_time or self._utc_now_iso()
+        exit_exec_ts = exit_exec_time or exit_signal_ts
         equity_after = self._wallet_equity()
         self._equity_cache = equity_after
-        self._append_log_row(
-            {
-                "timestamp_entry": self._live_state.get("timestamp_entry", ""),
-                "timestamp_exit": pd.Timestamp.utcnow().isoformat(),
-                "direction": direction.upper(),
-                "entry_price": round(entry_price, 8),
-                "exit_price": round(exit_price, 8),
-                "size": size,
-                "sl_price": self._live_state.get("sl_price", ""),
-                "tp_price": self._live_state.get("tp_price", ""),
-                "gross_pnl": round(gross_pnl, 8),
-                "fees": round(fees, 8),
-                "net_pnl": round(net_pnl, 8),
-                "equity_after_trade": round(equity_after, 8),
-                "reason_exit": reason or "",
-            }
+        trade_row = {
+            "trade_id": state.get("trade_id", state.get("entry_order_id", "")),
+            "strategy_name": self.settings.strategy_name,
+            "strategy_version": self.settings.strategy_version,
+            "symbol": self.settings.symbol,
+            "interval": self.settings.interval,
+            "side": state.get("side", direction.upper()),
+            "entry_signal_time": state.get("entry_signal_time", ""),
+            "entry_exec_time": entry_exec_ts,
+            "exit_signal_time": exit_signal_ts,
+            "exit_exec_time": exit_exec_ts,
+            "entry_reason": state.get("entry_reason", ""),
+            "exit_reason": reason or "",
+            "market_regime": state.get("market_regime", ""),
+            "signal_open": state.get("signal_open", ""),
+            "signal_high": state.get("signal_high", ""),
+            "signal_low": state.get("signal_low", ""),
+            "signal_close": state.get("signal_close", ""),
+            "entry_price_expected": round(entry_expected_price, 8) if entry_expected_price > 0 else "",
+            "entry_price_filled": round(entry_price, 8) if entry_price > 0 else "",
+            "exit_price_expected": round(exit_expected_price, 8) if exit_expected_price > 0 else "",
+            "exit_price_filled": round(exit_price, 8) if exit_price > 0 else "",
+            "position_size": size,
+            "notional_usdt": state.get("notional_usdt", round(entry_price * size, 8)),
+            "leverage": state.get("leverage", self.settings.leverage),
+            "stop_loss_price": state.get("sl_price", ""),
+            "take_profit_price": state.get("tp_price", ""),
+            "trailing_stop_price": state.get("trailing_stop_price", ""),
+            "ema_value": state.get("ema_value", ""),
+            "atr_value": state.get("atr_value", ""),
+            "adx_value": state.get("adx_value", ""),
+            "volume": state.get("volume", ""),
+            "volume_ma": state.get("volume_ma", ""),
+            "breakout_level": state.get("breakout_level", ""),
+            "zscore": state.get("zscore", ""),
+            "fee_entry": round(entry_fee, 8),
+            "fee_exit": round(exit_fee, 8),
+            "slippage_entry": round(entry_price - entry_expected_price, 8) if entry_expected_price > 0 else "",
+            "slippage_exit": round(exit_price - exit_expected_price, 8) if exit_expected_price > 0 else "",
+            "max_unrealized_profit": state.get("max_unrealized_profit", 0.0),
+            "max_unrealized_loss": state.get("max_unrealized_loss", 0.0),
+            "max_favorable_excursion": state.get("max_favorable_excursion", 0.0),
+            "max_adverse_excursion": state.get("max_adverse_excursion", 0.0),
+            "gross_pnl": round(gross_pnl, 8),
+            "net_pnl": round(net_pnl, 8),
+            "r_multiple": round(net_pnl / risk_amount, 8) if risk_amount > 0 else "",
+            "bars_held": int(state.get("bars_held", 0) or 0),
+            "signal_valid": int(state.get("signal_valid", 1) or 0),
+            "missed_trade": int(state.get("missed_trade", 0) or 0),
+            "wrong_trade": int(state.get("wrong_trade", 0) or 0),
+            "exchange_error": int(state.get("exchange_error", 0) or 0),
+            "data_error": int(state.get("data_error", 0) or 0),
+            "server_error": int(state.get("server_error", 0) or 0),
+            "manual_intervention": int(state.get("manual_intervention", 0) or 0),
+            "notes": state.get("notes", ""),
+        }
+        self._append_capped_csv(
+            self.settings.trade_log,
+            TRADE_LOG_HEADERS,
+            trade_row,
+            self.settings.trade_log_limit,
+        )
+        self._log_event(
+            "exit_exec",
+            f"{reason or 'exit'} net_pnl={net_pnl:.8f}",
+            trade_id=str(trade_row["trade_id"]),
+            side=str(trade_row["side"]),
+            price=exit_price,
+            event_time=exit_exec_ts,
         )
         print(f"[live] exit detected ({reason}); logged trade with net PnL {net_pnl:.6f}")
         self._live_state = None
         self._cooldown_left = max(0, int(self.settings.cooldown_bars))
 
-    def _market_exit_live_position(self, reason: str, fallback_price: float) -> bool:
+    def _market_exit_live_position(
+        self,
+        reason: str,
+        fallback_price: float,
+        expected_price: float | None = None,
+    ) -> bool:
         if not self.settings.live or not self._live_state:
             return False
         direction = self._live_state.get("direction", "")
         qty = abs(self._position_amt())
         if qty <= 0:
             return False
+        signal_time = self._utc_now_iso()
+        signal_price = expected_price if expected_price is not None else fallback_price
+        self._log_event("exit_signal", reason, price=signal_price, event_time=signal_time)
         try:
             self.client.cancel_open_orders(symbol=self.settings.symbol)
         except (ClientError, AttributeError) as exc:
             msg = getattr(exc, "error_message", str(exc))
+            note = f"cancel_open_orders failed: {msg}"
+            self._mark_live_flag("exchange_error", note)
+            self._log_event("exchange_error", note)
             print(f"[warn] cancel_open_orders failed: {msg}")
         exit_side = "SELL" if direction == "long" else "BUY"
         try:
@@ -536,14 +853,26 @@ class FuturesBot:
                 reduceOnly="true",
             )
         except ClientError as exc:
+            note = f"strategy exit order failed: {exc.error_message}"
+            self._mark_live_flag("exchange_error", note)
+            self._log_event("exchange_error", note, price=fallback_price, event_time=signal_time)
             print(f"[error] strategy exit order failed: {exc.error_message}")
             return False
         exit_order_id = int(order.get("orderId"))
         trades = self._order_trades(exit_order_id)
-        exit_price, exit_fee = self._trades_avg_price_and_fee(trades)
+        exit_price, exit_fee, exit_exec_time = self._trades_summary(trades)
         if exit_price <= 0:
             exit_price = float(order.get("avgPrice") or fallback_price)
-        self._log_live_exit(exit_price, exit_fee, reason)
+        if not exit_exec_time:
+            exit_exec_time = self._iso_from_ms(order.get("updateTime") or order.get("time"))
+        self._log_live_exit(
+            exit_price,
+            exit_fee,
+            reason,
+            exit_exec_time=exit_exec_time,
+            exit_signal_time=signal_time,
+            exit_expected_price=signal_price,
+        )
         return True
 
     def _bars_held(self, df: pd.DataFrame) -> int:
@@ -570,6 +899,7 @@ class FuturesBot:
         direction = self._live_state.get("direction", "")
         bars_held = self._bars_held(df)
         self._live_state["bars_held"] = bars_held
+        self._update_live_trade_extremes(last)
 
         latest_open_time = float(last.get("open_time", 0) or 0)
         entry_open_time = float(self._live_state.get("entry_signal_open_time", 0) or 0)
@@ -585,13 +915,15 @@ class FuturesBot:
             if direction == "long":
                 peak = float(self._live_state.get("peak_price", high) or high)
                 dynamic_stop = peak - (self.settings.trail_atr_mult * atr)
+                self._live_state["trailing_stop_price"] = round(dynamic_stop, 8)
                 if low <= dynamic_stop:
-                    return self._market_exit_live_position("trailing_stop", close)
+                    return self._market_exit_live_position("trailing_stop", close, dynamic_stop)
             elif direction == "short":
                 trough = float(self._live_state.get("trough_price", low) or low)
                 dynamic_stop = trough + (self.settings.trail_atr_mult * atr)
+                self._live_state["trailing_stop_price"] = round(dynamic_stop, 8)
                 if high >= dynamic_stop:
-                    return self._market_exit_live_position("trailing_stop", close)
+                    return self._market_exit_live_position("trailing_stop", close, dynamic_stop)
 
         if bars_held < self.settings.min_hold_bars or math.isnan(rolling_mean):
             return False
@@ -610,9 +942,9 @@ class FuturesBot:
             )
         )
         if mean_hit:
-            return self._market_exit_live_position("midline_exit", close)
+            return self._market_exit_live_position("midline_exit", close, close)
         if opposite_hit:
-            return self._market_exit_live_position("opposite_signal", close)
+            return self._market_exit_live_position("opposite_signal", close, close)
         return False
 
     def _wallet_equity(self) -> float:
@@ -622,51 +954,6 @@ class FuturesBot:
             return 0.0
         return float(usdt.get("balance", 0.0) or 0.0)
 
-    def _append_log_row(self, row: Dict[str, object]) -> None:
-        path = self.settings.live_log
-        header_needed = not os.path.exists(path)
-        with open(path, "a", encoding="ascii") as f:
-            if header_needed:
-                f.write(
-                    ",".join(
-                        [
-                            "timestamp_entry",
-                            "timestamp_exit",
-                            "direction",
-                            "entry_price",
-                            "exit_price",
-                            "size",
-                            "sl_price",
-                            "tp_price",
-                            "gross_pnl",
-                            "fees",
-                            "net_pnl",
-                            "equity_after_trade",
-                            "reason_exit",
-                        ]
-                    )
-                    + "\n"
-                )
-            f.write(
-                ",".join(
-                    [
-                        str(row.get("timestamp_entry", "")),
-                        str(row.get("timestamp_exit", "")),
-                        str(row.get("direction", "")),
-                        f"{row.get('entry_price', '')}",
-                        f"{row.get('exit_price', '')}",
-                        f"{row.get('size', '')}",
-                        f"{row.get('sl_price', '')}",
-                        f"{row.get('tp_price', '')}",
-                        f"{row.get('gross_pnl', '')}",
-                        f"{row.get('fees', '')}",
-                        f"{row.get('net_pnl', '')}",
-                        f"{row.get('equity_after_trade', '')}",
-                        str(row.get("reason_exit", "")),
-                    ]
-                )
-                + "\n"
-            )
 
     def _round_to(self, value: float, step: float) -> float:
         precision = max(int(round(-math.log(step, 10))) if step < 1 else 0, 0)
@@ -777,7 +1064,6 @@ class FuturesBot:
                 )
             else:
                 raise
-        effective_entry = float(order.get("avgPrice") or price)
         try:
             tp_order = self.client.new_order(
                 symbol=self.settings.symbol,
@@ -807,9 +1093,11 @@ class FuturesBot:
         stop_order_id = int(stop_order.get("orderId"))
         tp_order_id = int(tp_order.get("orderId"))
         trades = self._order_trades(entry_order_id)
-        entry_price, entry_fee = self._trades_avg_price_and_fee(trades)
+        entry_price, entry_fee, entry_exec_time = self._trades_summary(trades)
         if entry_price <= 0:
             entry_price = float(order.get("avgPrice") or price)
+        if not entry_exec_time:
+            entry_exec_time = self._iso_from_ms(order.get("updateTime") or order.get("time"))
         return {
             "direction": "long" if direction > 0 else "short",
             "entry_order_id": entry_order_id,
@@ -817,6 +1105,7 @@ class FuturesBot:
             "tp_order_id": tp_order_id,
             "entry_price": entry_price,
             "entry_fee": entry_fee,
+            "entry_exec_time": entry_exec_time or self._utc_now_iso(),
             "size": qty,
             "sl_price": stop_price,
             "tp_price": tp_price,
@@ -916,13 +1205,61 @@ class FuturesBot:
             state = self._place_orders(direction, qty, stop_price, tp_price, slippage_price)
             state.update(
                 {
+                    "trade_id": str(state["entry_order_id"]),
+                    "side": signal_label,
+                    "entry_signal_time": self._iso_from_ms(last.get("close_time", 0) or 0) or timestamp,
                     "entry_signal_open_time": int(last.get("open_time", 0) or 0),
+                    "entry_reason": signal_reason,
+                    "market_regime": regime,
+                    "signal_open": float(last.get("open", float("nan"))),
+                    "signal_high": float(last.get("high", float("nan"))),
+                    "signal_low": float(last.get("low", float("nan"))),
+                    "signal_close": float(last.get("close", float("nan"))),
+                    "entry_price_expected": price,
+                    "notional_usdt": round(state["entry_price"] * qty, 8),
+                    "leverage": self.settings.leverage,
+                    "trailing_stop_price": "",
+                    "ema_value": float(last.get("trend_ema", float("nan"))),
+                    "atr_value": atr,
+                    "adx_value": float(last.get("adx", float("nan"))),
+                    "volume": float(last.get("volume", float("nan"))),
+                    "volume_ma": float(last.get("volume_ma", float("nan"))),
+                    "breakout_level": lower_band if direction > 0 else upper_band,
+                    "zscore": zscore,
+                    "max_unrealized_profit": 0.0,
+                    "max_unrealized_loss": 0.0,
+                    "max_favorable_excursion": 0.0,
+                    "max_adverse_excursion": 0.0,
+                    "signal_valid": 1,
+                    "missed_trade": 0,
+                    "wrong_trade": 0,
+                    "exchange_error": 0,
+                    "data_error": 0,
+                    "server_error": 0,
+                    "manual_intervention": 0,
+                    "notes": "",
                     "bars_held": 0,
                     "peak_price": float(last.get("high", price) or price),
                     "trough_price": float(last.get("low", price) or price),
                 }
             )
             self._live_state = state
+            self._log_event(
+                "entry_signal",
+                signal_reason,
+                trade_id=state["trade_id"],
+                side=signal_label,
+                price=price,
+                event_time=state["entry_signal_time"],
+            )
+            self._log_event(
+                "entry_exec",
+                f"entry_order_id={state['entry_order_id']}",
+                trade_id=state["trade_id"],
+                side=signal_label,
+                price=state["entry_price"],
+                event_time=state["entry_exec_time"],
+            )
             print(
                 f"[cycle] {cycle} @ {timestamp} "
                 f"signal={signal_label} price={price:.4f} atr={atr:.4f} "
@@ -932,6 +1269,12 @@ class FuturesBot:
                 f"tp_id={state['tp_order_id']} entry={state['entry_price']:.6f}"
             )
         except ClientError as exc:
+            self._log_event(
+                "exchange_error",
+                f"entry order failed: {exc.error_message}",
+                side=signal_label,
+                price=price,
+            )
             print(f"[error] order failed: {exc.error_message}")
         return False
 
@@ -1108,9 +1451,32 @@ def parse_settings() -> Settings:
     parser.add_argument("--live", action="store_true", help="execute live orders")
     parser.add_argument("--testnet", action="store_true", help="use Binance Futures testnet")
     parser.add_argument(
+        "--trade-log",
+        dest="trade_log",
+        default=os.getenv("BOT_TRADE_LOG", os.getenv("BOT_LIVE_LOG", "reports/trade_log.csv")),
+        help="CSV path for completed trade logs",
+    )
+    parser.add_argument(
         "--live-log",
-        default=os.getenv("BOT_LIVE_LOG", "reports/live_trades.csv"),
-        help="CSV path to append live trade logs",
+        dest="trade_log",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--event-log",
+        default=os.getenv("BOT_EVENT_LOG", "reports/event_log.csv"),
+        help="CSV path for entry/exit/error event logs",
+    )
+    parser.add_argument(
+        "--trade-log-limit",
+        type=int,
+        default=int(os.getenv("BOT_TRADE_LOG_LIMIT", "1000")),
+        help="maximum number of rows to keep in trade_log.csv; 0 keeps all rows",
+    )
+    parser.add_argument(
+        "--event-log-limit",
+        type=int,
+        default=int(os.getenv("BOT_EVENT_LOG_LIMIT", "1000")),
+        help="maximum number of rows to keep in event_log.csv; 0 keeps all rows",
     )
     parser.add_argument(
         "--api-timeout",
@@ -1166,6 +1532,8 @@ def parse_settings() -> Settings:
         raise SystemExit("--reentry-buffer-bps must be >= 0.")
     if args.min_hold_bars < 0 or args.cooldown_bars < 0:
         raise SystemExit("Hold/cooldown bars must be >= 0.")
+    if args.trade_log_limit < 0 or args.event_log_limit < 0:
+        raise SystemExit("Log row limits must be >= 0.")
     required_lookback = max(
         args.range_lookback + 2,
         args.atr_period + 2,
@@ -1210,7 +1578,10 @@ def parse_settings() -> Settings:
         live=args.live,
         loop=args.loop,
         poll_seconds=max(1, args.sleep),
-        live_log=args.live_log,
+        trade_log=args.trade_log,
+        event_log=args.event_log,
+        trade_log_limit=args.trade_log_limit,
+        event_log_limit=args.event_log_limit,
         api_timeout=args.api_timeout,
         api_retries=args.api_retries,
         api_retry_backoff=args.api_retry_backoff,
