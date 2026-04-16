@@ -142,17 +142,19 @@ def _adx(data: pd.DataFrame, period: int) -> pd.Series:
     minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
 
     tr = _true_range(data)
-    atr = tr.ewm(alpha=1 / period, adjust=False).mean().replace(0, pd.NA)
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+    atr = atr.where(atr != 0.0)
     plus_di = (100.0 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr).fillna(0.0)
     minus_di = (100.0 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr).fillna(0.0)
-    dx = (100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)).fillna(0.0)
+    di_sum = plus_di + minus_di
+    dx = (100.0 * (plus_di - minus_di).abs() / di_sum.where(di_sum != 0.0)).fillna(0.0)
     return dx.ewm(alpha=1 / period, adjust=False).mean().fillna(0.0)
 
 
 def _efficiency_ratio(series: pd.Series, lookback: int) -> pd.Series:
     net_move = (series - series.shift(lookback)).abs()
     path_length = series.diff().abs().rolling(lookback).sum()
-    return (net_move / path_length.replace(0, pd.NA)).fillna(0.0)
+    return (net_move / path_length.where(path_length != 0.0)).fillna(0.0)
 
 
 def _rolling_mean_crosses(close: pd.Series, rolling_mean: pd.Series, lookback: int) -> pd.Series:
@@ -441,7 +443,7 @@ class FuturesBot:
         df["lower_band"] = df["low"].rolling(lookback).min().shift(1)
         df["zscore"] = (
             (df["close"] - df["rolling_mean"])
-            / df["rolling_std"].replace(0, pd.NA)
+            / df["rolling_std"].where(df["rolling_std"] != 0.0)
         )
         df["zscore"] = df["zscore"].fillna(0.0)
 
@@ -470,7 +472,7 @@ class FuturesBot:
             )
             df["trend_extension_atr"] = (
                 (df["close"] - df["trend_ema"]).abs()
-                / df["atr"].replace(0, pd.NA)
+                / df["atr"].where(df["atr"] != 0.0)
             ).fillna(0.0)
         else:
             df["trend_ema"] = pd.NA
