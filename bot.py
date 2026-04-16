@@ -169,7 +169,7 @@ class Settings:
     testnet: bool = False
     live: bool = False
     base_url: str | None = None
-    loop: bool = False
+    loop: bool = True
     poll_seconds: int = 300
     trade_log: str = "reports/trade_log.csv"
     event_log: str = "reports/event_log.csv"
@@ -1446,7 +1446,14 @@ def parse_settings() -> Settings:
     parser.add_argument(
         "--loop",
         action="store_true",
+        default=True,
         help="keep polling continuously instead of exiting after one check",
+    )
+    parser.add_argument(
+        "--no-loop",
+        dest="loop",
+        action="store_false",
+        help="run one check and exit",
     )
     parser.add_argument("--live", action="store_true", help="execute live orders")
     parser.add_argument("--testnet", action="store_true", help="use Binance Futures testnet")
