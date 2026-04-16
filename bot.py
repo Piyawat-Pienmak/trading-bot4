@@ -15,6 +15,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _utc_now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
+
+
 TRADE_LOG_HEADERS = [
     "trade_id",
     "strategy_name",
@@ -297,7 +302,7 @@ class FuturesBot:
         df.sort_values("open_time", inplace=True)
         df.reset_index(drop=True, inplace=True)
         # drop last incomplete candle (close_time in future)
-        now_ms = pd.Timestamp.utcnow().timestamp() * 1000
+        now_ms = _utc_now().timestamp() * 1000
         if now_ms < float(df.iloc[-1]["close_time"]):
             df = df.iloc[:-1]
         df[["open", "high", "low", "close", "volume"]] = df[
@@ -502,7 +507,7 @@ class FuturesBot:
 
     @staticmethod
     def _utc_now_iso() -> str:
-        return pd.Timestamp.utcnow().isoformat()
+        return _utc_now().isoformat()
 
     @staticmethod
     def _iso_from_ms(value: float | int | None) -> str:
@@ -1109,7 +1114,7 @@ class FuturesBot:
             "size": qty,
             "sl_price": stop_price,
             "tp_price": tp_price,
-            "timestamp_entry": pd.Timestamp.utcnow().isoformat(),
+            "timestamp_entry": _utc_now().isoformat(),
         }
 
     def _build_orders(
@@ -1607,7 +1612,7 @@ def main() -> None:
     try:
         while True:
             cycle += 1
-            timestamp = f"{pd.Timestamp.utcnow().isoformat()}Z"
+            timestamp = _utc_now().isoformat()
             sleep_for = max(1, settings.poll_seconds) if settings.loop else None
             flat_logged = bot.run_once(cycle, timestamp, sleep_for)
             if not settings.loop:
