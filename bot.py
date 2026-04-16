@@ -1565,7 +1565,7 @@ def parse_settings() -> Settings:
     parser.add_argument(
         "--trend-extension-atr",
         type=float,
-        default=float(os.getenv("BOT_TREND_EXTENSION_ATR", "1.0")),
+        default=float(os.getenv("BOT_TREND_EXTENSION_ATR", "0.0")),
         help="reject entries when price is this many ATRs from the trend EMA; 0 disables it",
     )
     parser.add_argument(
