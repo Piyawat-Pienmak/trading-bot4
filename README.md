@@ -74,7 +74,7 @@ Most settings can be passed as CLI flags or by matching `BOT_*` environment vari
 - Signal: `--range-lookback` (`20`), `--zscore-threshold` (`1.0`), `--position-mode` (`both`), `--reentry-buffer-bps` (`5.0`)
 - Exits: `--atr-period` (`14`), `--stop-atr-mult` (`2.0`), `--take-atr-mult` (`3.0`), `--trail-atr-mult` (`0.0`), `--min-hold-bars` (`1`), `--cooldown-bars` (`1`), `--exit-on-midline`, `--exit-on-opposite-signal`
 - Regime/volume filters: `--trend-ema-length` (`100`), `--trend-slope-lookback` (`5`), `--regime-threshold-bps` (`0.0`), `--trend-adx-period` (`14`), `--trend-adx-threshold` (`0.0`), `--trend-extension-atr` (`1.0`), `--max-efficiency-ratio` (`0.0`), `--min-mean-crosses` (`0`), `--volume-ma-period` (`20`), `--volume-max-mult` (`0.0`)
-- Runtime/logging: `--loop`, `--sleep` (`300`), `--live`, `--testnet`, `--trade-log`, `--event-log`, `--trade-log-limit` (`1000`), `--event-log-limit` (`1000`), `--api-timeout` (`10`), `--api-retries` (`3`), `--api-retry-backoff` (`2.0`), `--log-flat`
+- Runtime/logging: `--loop`, `--sleep` (`300`), `--live`, `--testnet`, `--trade-log`, `--event-log`, `--signal-diagnostics-log`, `--trade-log-limit` (`1000`), `--event-log-limit` (`1000`), `--signal-diagnostics-limit` (`1000`), `--api-timeout` (`10`), `--api-retries` (`3`), `--api-retry-backoff` (`2.0`), `--log-flat`
 
 Examples:
 
@@ -88,6 +88,7 @@ python bot.py --testnet --loop --sleep 60 --trade-log reports/my_trades.csv
 
 - `reports/trade_log.csv` stores completed live trades with signal timestamps, expected vs filled prices, stop and take-profit levels, fees, slippage, MFE/MAE, PnL, and diagnostic flags.
 - `reports/event_log.csv` stores timestamped entry, exit, and error events.
+- `reports/signal_diagnostics.csv` stores rolling signal diagnostics for the latest closed candle whenever there is a candidate, rejection, or final signal. New rows are written first and the file is capped at 1000 rows by default.
 
 ## Backtesting
 

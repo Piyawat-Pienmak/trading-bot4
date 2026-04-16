@@ -87,6 +87,33 @@ EVENT_LOG_HEADERS = [
     "details",
 ]
 
+SIGNAL_DIAGNOSTICS_HEADERS = [
+    "timestamp",
+    "close_time",
+    "symbol",
+    "interval",
+    "close",
+    "pre_regime_signal",
+    "final_signal",
+    "regime_rejected_signal",
+    "candidate_side",
+    "final_side",
+    "rejected_side",
+    "regime_reject_reasons",
+    "rejected_by_regime_threshold_bps",
+    "rejected_by_trend_adx_threshold",
+    "rejected_by_trend_extension_atr",
+    "rejected_by_efficiency_ratio",
+    "rejected_by_mean_cross_count",
+    "trend_slope_bps",
+    "adx",
+    "trend_extension_atr",
+    "efficiency_ratio",
+    "mean_cross_count",
+    "regime",
+    "trend_ema",
+]
+
 DEFAULT_STRATEGY_NAME = "range_mean_reversion"
 DEFAULT_STRATEGY_VERSION = "1"
 
@@ -178,8 +205,10 @@ class Settings:
     poll_seconds: int = 300
     trade_log: str = "reports/trade_log.csv"
     event_log: str = "reports/event_log.csv"
+    signal_diagnostics_log: str = "reports/signal_diagnostics.csv"
     trade_log_limit: int = 1000
     event_log_limit: int = 1000
+    signal_diagnostics_limit: int = 1000
     strategy_name: str = DEFAULT_STRATEGY_NAME
     strategy_version: str = DEFAULT_STRATEGY_VERSION
     api_retries: int = 3
@@ -206,7 +235,11 @@ class FuturesBot:
         self._live_state: dict | None = None
         self._equity_cache: float | None = None
         self._cooldown_left = 0
-        for path in (self.settings.trade_log, self.settings.event_log):
+        for path in (
+            self.settings.trade_log,
+            self.settings.event_log,
+            self.settings.signal_diagnostics_log,
+        ):
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
     def _call_with_retries(self, func, *args, **kwargs):
@@ -406,6 +439,11 @@ class FuturesBot:
             else pd.Series(False, index=df.index)
         )
 
+        df["rejected_by_regime_threshold_bps"] = False
+        df["rejected_by_trend_adx_threshold"] = False
+        df["rejected_by_trend_extension_atr"] = False
+        df["rejected_by_efficiency_ratio"] = False
+        df["rejected_by_mean_cross_count"] = False
         df["regime_reject_reasons"] = ""
         df["regime_rejected_signal"] = 0
         if self.settings.trend_ema_length > 0 and (
@@ -423,18 +461,23 @@ class FuturesBot:
                 | insufficient_crosses
             )
             rejected = (short_reentry | long_reentry) & ~sideways_regime
+            df.loc[rejected, "rejected_by_regime_threshold_bps"] = slope_trend[rejected]
+            df.loc[rejected, "rejected_by_trend_adx_threshold"] = adx_trend[rejected]
+            df.loc[rejected, "rejected_by_trend_extension_atr"] = extension_trend[rejected]
+            df.loc[rejected, "rejected_by_efficiency_ratio"] = efficient_trend[rejected]
+            df.loc[rejected, "rejected_by_mean_cross_count"] = insufficient_crosses[rejected]
             df.loc[rejected, "regime_rejected_signal"] = df.loc[
                 rejected, "pre_regime_signal"
             ]
             reject_checks = [
-                (slope_trend, "regime_threshold_bps"),
-                (adx_trend, "trend_adx_threshold"),
-                (extension_trend, "trend_extension_atr"),
-                (efficient_trend, "max_efficiency_ratio"),
-                (insufficient_crosses, "min_mean_crosses"),
+                ("rejected_by_regime_threshold_bps", "regime_threshold_bps"),
+                ("rejected_by_trend_adx_threshold", "trend_adx_threshold"),
+                ("rejected_by_trend_extension_atr", "trend_extension_atr"),
+                ("rejected_by_efficiency_ratio", "max_efficiency_ratio"),
+                ("rejected_by_mean_cross_count", "min_mean_crosses"),
             ]
-            for mask, label in reject_checks:
-                matches = rejected & mask
+            for column_name, label in reject_checks:
+                matches = rejected & df[column_name]
                 if matches.any():
                     current = df.loc[matches, "regime_reject_reasons"]
                     df.loc[matches, "regime_reject_reasons"] = (
@@ -539,6 +582,8 @@ class FuturesBot:
         fieldnames: List[str],
         row: Dict[str, object],
         limit: int,
+        prepend_newest: bool = False,
+        dedupe_keys: Tuple[str, ...] = (),
     ) -> None:
         rows: List[Dict[str, object]] = []
         if os.path.exists(path):
@@ -547,9 +592,19 @@ class FuturesBot:
                 if reader.fieldnames:
                     for existing in reader:
                         rows.append({name: existing.get(name, "") for name in fieldnames})
-        rows.append({name: self._csv_value(row.get(name, "")) for name in fieldnames})
+        new_row = {name: self._csv_value(row.get(name, "")) for name in fieldnames}
+        if dedupe_keys:
+            rows = [
+                existing
+                for existing in rows
+                if any(str(existing.get(key, "")) != str(new_row.get(key, "")) for key in dedupe_keys)
+            ]
+        if prepend_newest:
+            rows = [new_row] + rows
+        else:
+            rows.append(new_row)
         if limit > 0:
-            rows = rows[-limit:]
+            rows = rows[:limit] if prepend_newest else rows[-limit:]
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -595,6 +650,49 @@ class FuturesBot:
                 "details": details,
             },
             self.settings.event_log_limit,
+        )
+
+    def _log_signal_diagnostic(self, row: pd.Series) -> None:
+        pre_regime_signal = int(row.get("pre_regime_signal", 0) or 0)
+        final_signal = int(row.get("signal", 0) or 0)
+        rejected_signal = int(row.get("regime_rejected_signal", 0) or 0)
+        if pre_regime_signal == 0 and final_signal == 0 and rejected_signal == 0:
+            return
+        timestamp = self._iso_from_ms(row.get("open_time", 0) or 0)
+        close_time = self._iso_from_ms(row.get("close_time", 0) or 0)
+        side_labels = {1: "long", -1: "short"}
+        self._append_capped_csv(
+            self.settings.signal_diagnostics_log,
+            SIGNAL_DIAGNOSTICS_HEADERS,
+            {
+                "timestamp": timestamp,
+                "close_time": close_time,
+                "symbol": self.settings.symbol,
+                "interval": self.settings.interval,
+                "close": row.get("close", ""),
+                "pre_regime_signal": pre_regime_signal,
+                "final_signal": final_signal,
+                "regime_rejected_signal": rejected_signal,
+                "candidate_side": side_labels.get(pre_regime_signal, ""),
+                "final_side": side_labels.get(final_signal, ""),
+                "rejected_side": side_labels.get(rejected_signal, ""),
+                "regime_reject_reasons": row.get("regime_reject_reasons", ""),
+                "rejected_by_regime_threshold_bps": row.get("rejected_by_regime_threshold_bps", False),
+                "rejected_by_trend_adx_threshold": row.get("rejected_by_trend_adx_threshold", False),
+                "rejected_by_trend_extension_atr": row.get("rejected_by_trend_extension_atr", False),
+                "rejected_by_efficiency_ratio": row.get("rejected_by_efficiency_ratio", False),
+                "rejected_by_mean_cross_count": row.get("rejected_by_mean_cross_count", False),
+                "trend_slope_bps": row.get("trend_slope_bps", ""),
+                "adx": row.get("adx", ""),
+                "trend_extension_atr": row.get("trend_extension_atr", ""),
+                "efficiency_ratio": row.get("efficiency_ratio", ""),
+                "mean_cross_count": row.get("mean_cross_count", ""),
+                "regime": row.get("regime", ""),
+                "trend_ema": row.get("trend_ema", ""),
+            },
+            self.settings.signal_diagnostics_limit,
+            prepend_newest=True,
+            dedupe_keys=("symbol", "interval", "timestamp"),
         )
 
     def _update_live_trade_extremes(self, row: pd.Series) -> None:
@@ -1150,6 +1248,7 @@ class FuturesBot:
         zscore = float(last.get("zscore", float("nan")))
         regime = str(last.get("regime", ""))
         _, signal_reason = self._signal_detail(last)
+        self._log_signal_diagnostic(last)
         if self._maybe_exit_on_strategy_signal(with_indicators):
             print(f"[cycle] {cycle} @ {timestamp}")
             return False
@@ -1479,6 +1578,11 @@ def parse_settings() -> Settings:
         help="CSV path for entry/exit/error event logs",
     )
     parser.add_argument(
+        "--signal-diagnostics-log",
+        default=os.getenv("BOT_SIGNAL_DIAGNOSTICS_LOG", "reports/signal_diagnostics.csv"),
+        help="CSV path for rolling signal diagnostics",
+    )
+    parser.add_argument(
         "--trade-log-limit",
         type=int,
         default=int(os.getenv("BOT_TRADE_LOG_LIMIT", "1000")),
@@ -1489,6 +1593,12 @@ def parse_settings() -> Settings:
         type=int,
         default=int(os.getenv("BOT_EVENT_LOG_LIMIT", "1000")),
         help="maximum number of rows to keep in event_log.csv; 0 keeps all rows",
+    )
+    parser.add_argument(
+        "--signal-diagnostics-limit",
+        type=int,
+        default=int(os.getenv("BOT_SIGNAL_DIAGNOSTICS_LIMIT", "1000")),
+        help="maximum number of rows to keep in signal_diagnostics.csv; 0 keeps all rows",
     )
     parser.add_argument(
         "--api-timeout",
@@ -1544,7 +1654,11 @@ def parse_settings() -> Settings:
         raise SystemExit("--reentry-buffer-bps must be >= 0.")
     if args.min_hold_bars < 0 or args.cooldown_bars < 0:
         raise SystemExit("Hold/cooldown bars must be >= 0.")
-    if args.trade_log_limit < 0 or args.event_log_limit < 0:
+    if (
+        args.trade_log_limit < 0
+        or args.event_log_limit < 0
+        or args.signal_diagnostics_limit < 0
+    ):
         raise SystemExit("Log row limits must be >= 0.")
     required_lookback = max(
         args.range_lookback + 2,
@@ -1592,8 +1706,10 @@ def parse_settings() -> Settings:
         poll_seconds=max(1, args.sleep),
         trade_log=args.trade_log,
         event_log=args.event_log,
+        signal_diagnostics_log=args.signal_diagnostics_log,
         trade_log_limit=args.trade_log_limit,
         event_log_limit=args.event_log_limit,
+        signal_diagnostics_limit=args.signal_diagnostics_limit,
         api_timeout=args.api_timeout,
         api_retries=args.api_retries,
         api_retry_backoff=args.api_retry_backoff,
