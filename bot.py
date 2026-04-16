@@ -12,9 +12,55 @@ from binance.error import ClientError
 from binance.um_futures import UMFutures
 from dotenv import load_dotenv
 
-from strategies.indicators import atr as atr_calc
-
 load_dotenv()
+
+
+def _true_range(data: pd.DataFrame) -> pd.Series:
+    prev_close = data["close"].shift(1)
+    tr1 = data["high"] - data["low"]
+    tr2 = (data["high"] - prev_close).abs()
+    tr3 = (data["low"] - prev_close).abs()
+    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+
+def _adx(data: pd.DataFrame, period: int) -> pd.Series:
+    up_move = data["high"].diff()
+    down_move = -data["low"].diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    tr = _true_range(data)
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean().replace(0, pd.NA)
+    plus_di = (100.0 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr).fillna(0.0)
+    minus_di = (100.0 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr).fillna(0.0)
+    dx = (100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)).fillna(0.0)
+    return dx.ewm(alpha=1 / period, adjust=False).mean().fillna(0.0)
+
+
+def _efficiency_ratio(series: pd.Series, lookback: int) -> pd.Series:
+    net_move = (series - series.shift(lookback)).abs()
+    path_length = series.diff().abs().rolling(lookback).sum()
+    return (net_move / path_length.replace(0, pd.NA)).fillna(0.0)
+
+
+def _rolling_mean_crosses(close: pd.Series, rolling_mean: pd.Series, lookback: int) -> pd.Series:
+    deviation = close - rolling_mean
+    prev_deviation = deviation.shift(1)
+    crossed = (
+        deviation.notna()
+        & prev_deviation.notna()
+        & (deviation != 0)
+        & (prev_deviation != 0)
+        & ((deviation > 0) != (prev_deviation > 0))
+    )
+    return crossed.rolling(lookback).sum().fillna(0.0)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -22,11 +68,28 @@ class Settings:
     symbol: str
     interval: str = "1h"
     lookback: int = 300
+    range_lookback: int = 20
+    zscore_threshold: float = 1.0
     atr_period: int = 14
-    ema_period: int = 200
-    breakout_lookback: int = 24
     stop_atr_mult: float = 2.0
-    tp_rr: float = 3.0
+    take_atr_mult: float = 3.0
+    trail_atr_mult: float = 0.0
+    position_mode: str = "both"
+    trend_ema_length: int = 100
+    trend_slope_lookback: int = 5
+    regime_threshold_bps: float = 0.0
+    trend_adx_period: int = 14
+    trend_adx_threshold: float = 0.0
+    trend_extension_atr: float = 1.0
+    max_efficiency_ratio: float = 0.0
+    min_mean_crosses: int = 0
+    volume_ma_period: int = 20
+    volume_max_mult: float = 0.0
+    reentry_buffer_bps: float = 5.0
+    min_hold_bars: int = 1
+    cooldown_bars: int = 1
+    exit_on_midline: bool = False
+    exit_on_opposite_signal: bool = False
     max_notional: float | None = None
     leverage: int = 3
     risk_pct: float = 0.01
@@ -34,7 +97,7 @@ class Settings:
     max_slippage_pct: float = 0.0015
     testnet: bool = False
     live: bool = False
-    base_url: str | None = "https://fapi.binance.com"
+    base_url: str | None = None
     loop: bool = False
     poll_seconds: int = 300
     live_log: str = "reports/live_trades.csv"
@@ -61,6 +124,7 @@ class FuturesBot:
         self.filters = self._fetch_filters(settings.symbol)
         self._live_state: dict | None = None
         self._equity_cache: float | None = None
+        self._cooldown_left = 0
         os.makedirs(os.path.dirname(self.settings.live_log) or ".", exist_ok=True)
 
     def _call_with_retries(self, func, *args, **kwargs):
@@ -151,28 +215,158 @@ class FuturesBot:
         now_ms = pd.Timestamp.utcnow().timestamp() * 1000
         if now_ms < float(df.iloc[-1]["close_time"]):
             df = df.iloc[:-1]
-        df[["open", "high", "low", "close"]] = df[
-            ["open", "high", "low", "close"]
+        df[["open", "high", "low", "close", "volume"]] = df[
+            ["open", "high", "low", "close", "volume"]
         ].astype(float)
         return df
 
     def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        df["ema200"] = df["close"].ewm(span=self.settings.ema_period, adjust=False).mean()
-        df["ema200_10"] = df["ema200"].shift(10)
-        df["atr"] = atr_calc(df, self.settings.atr_period)
-        df["hh24_prev"] = (
-            df["high"]
-            .rolling(window=self.settings.breakout_lookback, min_periods=self.settings.breakout_lookback)
-            .max()
-            .shift(1)
+        lookback = self.settings.range_lookback
+        df["rolling_mean"] = df["close"].rolling(lookback).mean()
+        df["rolling_std"] = df["close"].rolling(lookback).std(ddof=0)
+        df["upper_band"] = df["high"].rolling(lookback).max().shift(1)
+        df["lower_band"] = df["low"].rolling(lookback).min().shift(1)
+        df["zscore"] = (
+            (df["close"] - df["rolling_mean"])
+            / df["rolling_std"].replace(0, pd.NA)
         )
-        df["ll24_prev"] = (
-            df["low"]
-            .rolling(window=self.settings.breakout_lookback, min_periods=self.settings.breakout_lookback)
-            .min()
-            .shift(1)
+        df["zscore"] = df["zscore"].fillna(0.0)
+
+        tr = _true_range(df)
+        df["atr"] = tr.rolling(self.settings.atr_period).mean().bfill()
+        df["adx"] = _adx(df, self.settings.trend_adx_period)
+        df["efficiency_ratio"] = _efficiency_ratio(df["close"], lookback)
+        df["mean_cross_count"] = _rolling_mean_crosses(
+            df["close"], df["rolling_mean"], lookback
         )
+
+        df["volume_ma"] = df["volume"].rolling(self.settings.volume_ma_period).mean().bfill()
+        if self.settings.trend_ema_length > 0:
+            df["trend_ema"] = df["close"].ewm(
+                span=self.settings.trend_ema_length, adjust=False
+            ).mean()
+            df["trend_ema_prev"] = df["trend_ema"].shift(
+                self.settings.trend_slope_lookback
+            )
+            df["trend_slope_bps"] = (
+                (
+                    ((df["trend_ema"] / df["trend_ema_prev"]) - 1.0)
+                    / self.settings.trend_slope_lookback
+                ).fillna(0.0)
+                * 10000.0
+            )
+            df["trend_extension_atr"] = (
+                (df["close"] - df["trend_ema"]).abs()
+                / df["atr"].replace(0, pd.NA)
+            ).fillna(0.0)
+        else:
+            df["trend_ema"] = pd.NA
+            df["trend_ema_prev"] = pd.NA
+            df["trend_slope_bps"] = 0.0
+            df["trend_extension_atr"] = 0.0
+
+        buffer = self.settings.reentry_buffer_bps / 10000.0
+        prev_high_break = df["close"].shift(1) > df["upper_band"].shift(1)
+        prev_low_break = df["close"].shift(1) < df["lower_band"].shift(1)
+        short_reentry = (
+            prev_high_break
+            & (df["close"] <= df["upper_band"] * (1.0 - buffer))
+            & (df["zscore"] >= self.settings.zscore_threshold)
+        )
+        long_reentry = (
+            prev_low_break
+            & (df["close"] >= df["lower_band"] * (1.0 + buffer))
+            & (df["zscore"] <= -self.settings.zscore_threshold)
+        )
+
+        if self.settings.trend_ema_length > 0:
+            short_reentry &= df["close"] >= df["trend_ema"]
+            long_reentry &= df["close"] <= df["trend_ema"]
+
+        df["pre_regime_signal"] = 0
+        if self.settings.position_mode in {"both", "short"}:
+            df.loc[short_reentry, "pre_regime_signal"] = -1
+        if self.settings.position_mode in {"both", "long"}:
+            df.loc[long_reentry, "pre_regime_signal"] = 1
+
+        slope_trend = (
+            df["trend_slope_bps"].abs() >= self.settings.regime_threshold_bps
+            if self.settings.regime_threshold_bps > 0
+            else pd.Series(False, index=df.index)
+        )
+        adx_trend = (
+            df["adx"] >= self.settings.trend_adx_threshold
+            if self.settings.trend_adx_threshold > 0
+            else pd.Series(False, index=df.index)
+        )
+        extension_trend = (
+            df["trend_extension_atr"] >= self.settings.trend_extension_atr
+            if self.settings.trend_extension_atr > 0
+            else pd.Series(False, index=df.index)
+        )
+        efficient_trend = (
+            df["efficiency_ratio"] > self.settings.max_efficiency_ratio
+            if self.settings.max_efficiency_ratio > 0
+            else pd.Series(False, index=df.index)
+        )
+        insufficient_crosses = (
+            df["mean_cross_count"] < float(self.settings.min_mean_crosses)
+            if self.settings.min_mean_crosses > 0
+            else pd.Series(False, index=df.index)
+        )
+
+        df["regime_reject_reasons"] = ""
+        df["regime_rejected_signal"] = 0
+        if self.settings.trend_ema_length > 0 and (
+            self.settings.regime_threshold_bps > 0
+            or self.settings.trend_adx_threshold > 0
+            or self.settings.trend_extension_atr > 0
+            or self.settings.max_efficiency_ratio > 0
+            or self.settings.min_mean_crosses > 0
+        ):
+            sideways_regime = ~(
+                slope_trend
+                | adx_trend
+                | extension_trend
+                | efficient_trend
+                | insufficient_crosses
+            )
+            rejected = (short_reentry | long_reentry) & ~sideways_regime
+            df.loc[rejected, "regime_rejected_signal"] = df.loc[
+                rejected, "pre_regime_signal"
+            ]
+            reject_checks = [
+                (slope_trend, "regime_threshold_bps"),
+                (adx_trend, "trend_adx_threshold"),
+                (extension_trend, "trend_extension_atr"),
+                (efficient_trend, "max_efficiency_ratio"),
+                (insufficient_crosses, "min_mean_crosses"),
+            ]
+            for mask, label in reject_checks:
+                matches = rejected & mask
+                if matches.any():
+                    current = df.loc[matches, "regime_reject_reasons"]
+                    df.loc[matches, "regime_reject_reasons"] = (
+                        current.where(current == "", current + "|") + label
+                    )
+            short_reentry &= sideways_regime
+            long_reentry &= sideways_regime
+            df["regime"] = "sideways"
+            df.loc[~sideways_regime, "regime"] = "trend"
+        else:
+            df["regime"] = "sideways"
+
+        if self.settings.volume_max_mult > 0:
+            quiet_enough = df["volume"] <= df["volume_ma"] * self.settings.volume_max_mult
+            short_reentry &= quiet_enough
+            long_reentry &= quiet_enough
+
+        df["signal"] = 0
+        if self.settings.position_mode in {"both", "short"}:
+            df.loc[short_reentry, "signal"] = -1
+        if self.settings.position_mode in {"both", "long"}:
+            df.loc[long_reentry, "signal"] = 1
         return df
 
     def _signal_direction(self, row: pd.Series) -> int:
@@ -185,40 +379,40 @@ class FuturesBot:
 
     def _signal_decision(self, row: pd.Series, explain: bool) -> Tuple[int, str | None]:
         price = float(row["close"])
-        ema200 = float(row["ema200"])
-        ema200_10 = float(row.get("ema200_10", float("nan")))
+        rolling_mean = float(row.get("rolling_mean", float("nan")))
+        upper_band = float(row.get("upper_band", float("nan")))
+        lower_band = float(row.get("lower_band", float("nan")))
+        zscore = float(row.get("zscore", float("nan")))
         atr = float(row["atr"])
-        hh24_prev = float(row.get("hh24_prev", float("nan")))
-        ll24_prev = float(row.get("ll24_prev", float("nan")))
+        signal = int(row.get("signal", 0))
         reason = None
         if (
-            math.isnan(ema200)
-            or math.isnan(ema200_10)
+            math.isnan(rolling_mean)
+            or math.isnan(upper_band)
+            or math.isnan(lower_band)
+            or math.isnan(zscore)
             or math.isnan(atr)
-            or math.isnan(hh24_prev)
-            or math.isnan(ll24_prev)
         ):
             return 0, "missing indicators" if explain else None
-        long_ok = price > ema200 and ema200 > ema200_10 and price > hh24_prev
-        short_ok = price < ema200 and ema200 < ema200_10 and price < ll24_prev
-        bullish = long_ok
-        bearish = short_ok
-        if bullish:
+        if signal > 0:
             if explain:
                 reason = (
-                    f"LONG: close {price:.6f}>ema200 {ema200:.6f}, "
-                    f"ema200>ema200_10 {ema200_10:.6f}, "
-                    f"close {price:.6f}>hh24_prev {hh24_prev:.6f}"
+                    f"LONG re-entry: close {price:.6f}, lower_band {lower_band:.6f}, "
+                    f"mean {rolling_mean:.6f}, zscore {zscore:.2f}, atr {atr:.6f}"
                 )
             return 1, reason
-        if bearish:
+        if signal < 0:
             if explain:
                 reason = (
-                    f"SHORT: close {price:.6f}<ema200 {ema200:.6f}, "
-                    f"ema200<ema200_10 {ema200_10:.6f}, "
-                    f"close {price:.6f}<ll24_prev {ll24_prev:.6f}"
+                    f"SHORT re-entry: close {price:.6f}, upper_band {upper_band:.6f}, "
+                    f"mean {rolling_mean:.6f}, zscore {zscore:.2f}, atr {atr:.6f}"
                 )
             return -1, reason
+        rejected_signal = int(row.get("regime_rejected_signal", 0) or 0)
+        reject_reasons = str(row.get("regime_reject_reasons", "") or "")
+        if rejected_signal != 0 and explain:
+            side = "LONG" if rejected_signal > 0 else "SHORT"
+            return 0, f"{side} candidate rejected by regime filter: {reject_reasons}"
         return 0, "conditions not aligned" if explain else None
 
     def _latest_signal(self, df: pd.DataFrame) -> Tuple[int, float, float]:
@@ -276,6 +470,11 @@ class FuturesBot:
                 reason = "hit_tp"
         if filled_id is None:
             return
+        try:
+            self.client.cancel_open_orders(symbol=self.settings.symbol)
+        except (ClientError, AttributeError) as exc:
+            msg = getattr(exc, "error_message", str(exc))
+            print(f"[warn] cancel_open_orders failed after exit: {msg}")
         trades = self._order_trades(filled_id)
         exit_price, exit_fee = self._trades_avg_price_and_fee(trades)
         self._log_live_exit(exit_price, exit_fee, reason or "")
@@ -313,20 +512,12 @@ class FuturesBot:
         )
         print(f"[live] exit detected ({reason}); logged trade with net PnL {net_pnl:.6f}")
         self._live_state = None
+        self._cooldown_left = max(0, int(self.settings.cooldown_bars))
 
-    def _maybe_exit_on_ema_break(self, df: pd.DataFrame) -> bool:
+    def _market_exit_live_position(self, reason: str, fallback_price: float) -> bool:
         if not self.settings.live or not self._live_state:
             return False
-        last = df.iloc[-1]
-        ema200 = float(last.get("ema200", float("nan")))
-        close = float(last.get("close", float("nan")))
-        if math.isnan(ema200) or math.isnan(close):
-            return False
         direction = self._live_state.get("direction", "")
-        exit_long = direction == "long" and close < ema200
-        exit_short = direction == "short" and close > ema200
-        if not (exit_long or exit_short):
-            return False
         qty = abs(self._position_amt())
         if qty <= 0:
             return False
@@ -345,15 +536,84 @@ class FuturesBot:
                 reduceOnly="true",
             )
         except ClientError as exc:
-            print(f"[error] EMA exit order failed: {exc.error_message}")
+            print(f"[error] strategy exit order failed: {exc.error_message}")
             return False
         exit_order_id = int(order.get("orderId"))
         trades = self._order_trades(exit_order_id)
         exit_price, exit_fee = self._trades_avg_price_and_fee(trades)
         if exit_price <= 0:
-            exit_price = float(order.get("avgPrice") or close)
-        self._log_live_exit(exit_price, exit_fee, "EMA_break")
+            exit_price = float(order.get("avgPrice") or fallback_price)
+        self._log_live_exit(exit_price, exit_fee, reason)
         return True
+
+    def _bars_held(self, df: pd.DataFrame) -> int:
+        if not self._live_state:
+            return 0
+        entry_open_time = self._live_state.get("entry_signal_open_time")
+        if entry_open_time is None or "open_time" not in df.columns:
+            return int(self._live_state.get("bars_held", 0) or 0)
+        return int((df["open_time"].astype(float) > float(entry_open_time)).sum())
+
+    def _maybe_exit_on_strategy_signal(self, df: pd.DataFrame) -> bool:
+        if not self.settings.live or not self._live_state:
+            return False
+        last = df.iloc[-1]
+        close = float(last.get("close", float("nan")))
+        high = float(last.get("high", float("nan")))
+        low = float(last.get("low", float("nan")))
+        atr = float(last.get("atr", float("nan")))
+        rolling_mean = float(last.get("rolling_mean", float("nan")))
+        signal = int(last.get("signal", 0) or 0)
+        if math.isnan(close) or math.isnan(atr):
+            return False
+
+        direction = self._live_state.get("direction", "")
+        bars_held = self._bars_held(df)
+        self._live_state["bars_held"] = bars_held
+
+        latest_open_time = float(last.get("open_time", 0) or 0)
+        entry_open_time = float(self._live_state.get("entry_signal_open_time", 0) or 0)
+        if latest_open_time > entry_open_time:
+            if direction == "long":
+                peak = float(self._live_state.get("peak_price", high) or high)
+                self._live_state["peak_price"] = max(peak, high)
+            elif direction == "short":
+                trough = float(self._live_state.get("trough_price", low) or low)
+                self._live_state["trough_price"] = min(trough, low)
+
+        if self.settings.trail_atr_mult > 0 and latest_open_time > entry_open_time:
+            if direction == "long":
+                peak = float(self._live_state.get("peak_price", high) or high)
+                dynamic_stop = peak - (self.settings.trail_atr_mult * atr)
+                if low <= dynamic_stop:
+                    return self._market_exit_live_position("trailing_stop", close)
+            elif direction == "short":
+                trough = float(self._live_state.get("trough_price", low) or low)
+                dynamic_stop = trough + (self.settings.trail_atr_mult * atr)
+                if high >= dynamic_stop:
+                    return self._market_exit_live_position("trailing_stop", close)
+
+        if bars_held < self.settings.min_hold_bars or math.isnan(rolling_mean):
+            return False
+        mean_hit = (
+            self.settings.exit_on_midline
+            and (
+                (direction == "long" and close >= rolling_mean)
+                or (direction == "short" and close <= rolling_mean)
+            )
+        )
+        opposite_hit = (
+            self.settings.exit_on_opposite_signal
+            and (
+                (direction == "long" and signal == -1)
+                or (direction == "short" and signal == 1)
+            )
+        )
+        if mean_hit:
+            return self._market_exit_live_position("midline_exit", close)
+        if opposite_hit:
+            return self._market_exit_live_position("opposite_signal", close)
+        return False
 
     def _wallet_equity(self) -> float:
         balances = self.client.balance()
@@ -566,6 +826,8 @@ class FuturesBot:
     def _build_orders(
         self, direction: int, price: float, atr: float
     ) -> Tuple[float, float, float]:
+        if math.isnan(atr) or atr <= 0:
+            raise ValueError("ATR is unavailable; cannot build risk orders")
         tick = self.filters["tick_size"]
         stop_distance = self.settings.stop_atr_mult * atr
         raw_stop = price - stop_distance if direction > 0 else price + stop_distance
@@ -574,8 +836,7 @@ class FuturesBot:
             stop_price = self._round_to(max(price - tick, 0.0001), tick)
         elif direction < 0 and stop_price <= price:
             stop_price = self._round_to(price + tick, tick)
-        risk_dist = abs(price - stop_price)
-        tp_price = price + direction * (self.settings.tp_rr * risk_dist)
+        tp_price = price + direction * (self.settings.take_atr_mult * atr)
         tp_price = self._round_to(max(tp_price, 0.0001), tick)
         qty, _ = self._size_position(direction, price, stop_price)
         return qty, stop_price, tp_price
@@ -589,26 +850,40 @@ class FuturesBot:
         with_indicators = self._compute_indicators(klines)
         direction, price, atr = self._latest_signal(with_indicators)
         last = with_indicators.iloc[-1]
-        ema200 = float(last["ema200"])
-        ema200_10 = float(last.get("ema200_10", float("nan")))
-        if self._maybe_exit_on_ema_break(with_indicators):
+        rolling_mean = float(last.get("rolling_mean", float("nan")))
+        upper_band = float(last.get("upper_band", float("nan")))
+        lower_band = float(last.get("lower_band", float("nan")))
+        zscore = float(last.get("zscore", float("nan")))
+        regime = str(last.get("regime", ""))
+        _, signal_reason = self._signal_detail(last)
+        if self._maybe_exit_on_strategy_signal(with_indicators):
             print(f"[cycle] {cycle} @ {timestamp}")
             return False
         stop_price = float("nan")
         tp_price = float("nan")
+        qty = 0.0
         has_position = False
+        signal_label = "LONG" if direction > 0 else "SHORT" if direction < 0 else "FLAT"
         if direction != 0:
             has_position = self._has_open_position()
             if not has_position:
+                if self._cooldown_left > 0:
+                    self._cooldown_left -= 1
+                if self._cooldown_left > 0:
+                    print(
+                        f"[cycle] {cycle} @ {timestamp} signal={signal_label} "
+                        f"cooldown_bars_left={self._cooldown_left}; skipping new entry"
+                    )
+                    return False
                 qty, stop_price, tp_price = self._build_orders(direction, price, atr)
-        signal_label = "LONG" if direction > 0 else "SHORT" if direction < 0 else "FLAT"
         if direction == 0:
             if self.settings.log_flat:
                 line = (
                     f"[cycle] {cycle} @ {timestamp} "
                     f"signal={signal_label} price={price:.4f} atr={atr:.4f} "
-                    f"ema200={ema200:.4f} ema200_10={ema200_10:.4f} "
-                    f"sl={stop_price:.4f} tp={tp_price:.4f}"
+                    f"mean={rolling_mean:.4f} zscore={zscore:.2f} "
+                    f"range=({lower_band:.4f},{upper_band:.4f}) regime={regime} "
+                    f"reason={signal_reason}"
                 )
                 if sleep_for is not None:
                     line += f" sleep={sleep_for}s"
@@ -618,9 +893,10 @@ class FuturesBot:
         print(f"\n[cycle] {cycle} @ {timestamp}")
         if not self.settings.live:
             print(
-                f"[live] signal={signal_label} price={price:.4f} atr={atr:.4f} "
-                f"ema200={ema200:.4f} ema200_10={ema200_10:.4f} "
-                f"sl={stop_price:.4f} tp={tp_price:.4f}"
+                f"[signal] signal={signal_label} price={price:.4f} atr={atr:.4f} "
+                f"mean={rolling_mean:.4f} zscore={zscore:.2f} "
+                f"range=({lower_band:.4f},{upper_band:.4f}) regime={regime} "
+                f"sl={stop_price:.4f} tp={tp_price:.4f} reason={signal_reason}"
             )
         if has_position:
             print("[info] open position detected; skipping new entry")
@@ -638,11 +914,19 @@ class FuturesBot:
         self._ensure_leverage()
         try:
             state = self._place_orders(direction, qty, stop_price, tp_price, slippage_price)
+            state.update(
+                {
+                    "entry_signal_open_time": int(last.get("open_time", 0) or 0),
+                    "bars_held": 0,
+                    "peak_price": float(last.get("high", price) or price),
+                    "trough_price": float(last.get("low", price) or price),
+                }
+            )
             self._live_state = state
             print(
                 f"[cycle] {cycle} @ {timestamp} "
                 f"signal={signal_label} price={price:.4f} atr={atr:.4f} "
-                f"ema200={ema200:.4f} ema200_10={ema200_10:.4f} "
+                f"mean={rolling_mean:.4f} zscore={zscore:.2f} regime={regime} "
                 f"sl={stop_price:.4f} tp={tp_price:.4f} qty={qty} "
                 f"entry_id={state['entry_order_id']} stop_id={state['stop_order_id']} "
                 f"tp_id={state['tp_order_id']} entry={state['entry_price']:.6f}"
@@ -653,7 +937,9 @@ class FuturesBot:
 
 
 def parse_settings() -> Settings:
-    parser = argparse.ArgumentParser(description="Binance Futures bot (single cycle)")
+    parser = argparse.ArgumentParser(
+        description="Binance Futures mean-reversion bot (single cycle)"
+    )
     parser.add_argument("--symbol", default=os.getenv("BOT_SYMBOL", "DOGEUSDT"))
     parser.add_argument("--interval", default=os.getenv("BOT_INTERVAL", "1h"))
     parser.add_argument(
@@ -661,6 +947,152 @@ def parse_settings() -> Settings:
         type=int,
         default=int(os.getenv("BOT_LOOKBACK", "300")),
         help="number of candles to fetch (pagination; Binance limit 1500 per call)",
+    )
+    parser.add_argument(
+        "--range-lookback",
+        type=int,
+        default=int(os.getenv("BOT_RANGE_LOOKBACK", "20")),
+        help="rolling range and mean window used by the mean-reversion signal",
+    )
+    parser.add_argument(
+        "--zscore-threshold",
+        type=float,
+        default=float(os.getenv("BOT_ZSCORE_THRESHOLD", "1.0")),
+        help="minimum absolute z-score required for range re-entry",
+    )
+    parser.add_argument(
+        "--atr-period",
+        type=int,
+        default=int(os.getenv("BOT_ATR_PERIOD", "14")),
+        help="ATR period used for stop and take-profit distances",
+    )
+    parser.add_argument(
+        "--stop-atr-mult",
+        type=float,
+        default=float(os.getenv("BOT_STOP_ATR_MULT", "2.0")),
+        help="stop-loss distance in ATR multiples",
+    )
+    parser.add_argument(
+        "--take-atr-mult",
+        type=float,
+        default=float(os.getenv("BOT_TAKE_ATR_MULT", "3.0")),
+        help="take-profit distance in ATR multiples",
+    )
+    parser.add_argument(
+        "--trail-atr-mult",
+        type=float,
+        default=float(os.getenv("BOT_TRAIL_ATR_MULT", "0.0")),
+        help="optional soft trailing exit in ATR multiples; 0 disables it",
+    )
+    parser.add_argument(
+        "--position-mode",
+        choices=["both", "long", "short"],
+        default=os.getenv("BOT_POSITION_MODE", "both"),
+        help="trade direction mode",
+    )
+    parser.add_argument(
+        "--trend-ema-length",
+        type=int,
+        default=int(os.getenv("BOT_TREND_EMA_LENGTH", "100")),
+        help="EMA length for trend/regime filtering; 0 disables it",
+    )
+    parser.add_argument(
+        "--trend-slope-lookback",
+        type=int,
+        default=int(os.getenv("BOT_TREND_SLOPE_LOOKBACK", "5")),
+        help="bars used to smooth EMA slope for regime detection",
+    )
+    parser.add_argument(
+        "--regime-threshold-bps",
+        type=float,
+        default=float(os.getenv("BOT_REGIME_THRESHOLD_BPS", "0.0")),
+        help="reject entries when EMA slope magnitude exceeds this bps-per-bar threshold",
+    )
+    parser.add_argument(
+        "--trend-adx-period",
+        type=int,
+        default=int(os.getenv("BOT_TREND_ADX_PERIOD", "14")),
+        help="ADX period used for regime detection",
+    )
+    parser.add_argument(
+        "--trend-adx-threshold",
+        type=float,
+        default=float(os.getenv("BOT_TREND_ADX_THRESHOLD", "0.0")),
+        help="reject entries when ADX is at or above this value; 0 disables it",
+    )
+    parser.add_argument(
+        "--trend-extension-atr",
+        type=float,
+        default=float(os.getenv("BOT_TREND_EXTENSION_ATR", "1.0")),
+        help="reject entries when price is this many ATRs from the trend EMA; 0 disables it",
+    )
+    parser.add_argument(
+        "--max-efficiency-ratio",
+        type=float,
+        default=float(os.getenv("BOT_MAX_EFFICIENCY_RATIO", "0.0")),
+        help="reject entries when rolling efficiency ratio is above this value; 0 disables it",
+    )
+    parser.add_argument(
+        "--min-mean-crosses",
+        type=int,
+        default=int(os.getenv("BOT_MIN_MEAN_CROSSES", "0")),
+        help="minimum mean crosses in the range window; 0 disables it",
+    )
+    parser.add_argument(
+        "--volume-ma-period",
+        type=int,
+        default=int(os.getenv("BOT_VOLUME_MA_PERIOD", "20")),
+        help="volume moving-average period",
+    )
+    parser.add_argument(
+        "--volume-max-mult",
+        type=float,
+        default=float(os.getenv("BOT_VOLUME_MAX_MULT", "0.0")),
+        help="only enter when volume is at or below volume_ma times this value; 0 disables it",
+    )
+    parser.add_argument(
+        "--reentry-buffer-bps",
+        type=float,
+        default=float(os.getenv("BOT_REENTRY_BUFFER_BPS", "5.0")),
+        help="required move back inside the range in basis points",
+    )
+    parser.add_argument(
+        "--min-hold-bars",
+        type=int,
+        default=int(os.getenv("BOT_MIN_HOLD_BARS", "1")),
+        help="minimum bars to hold before soft midline/opposite exits",
+    )
+    parser.add_argument(
+        "--cooldown-bars",
+        type=int,
+        default=int(os.getenv("BOT_COOLDOWN_BARS", "1")),
+        help="bars to wait after a logged exit before a new entry",
+    )
+    parser.add_argument(
+        "--exit-on-midline",
+        dest="exit_on_midline",
+        action="store_true",
+        default=_env_bool("BOT_EXIT_ON_MIDLINE", False),
+        help="soft-exit when close reverts to the rolling mean",
+    )
+    parser.add_argument(
+        "--no-exit-on-midline",
+        dest="exit_on_midline",
+        action="store_false",
+        help="disable soft midline exits",
+    )
+    parser.add_argument(
+        "--exit-on-opposite-signal",
+        dest="exit_on_opposite_signal",
+        action="store_true",
+        default=_env_bool("BOT_EXIT_ON_OPPOSITE_SIGNAL", False),
+        help="soft-exit when the opposite mean-reversion signal appears",
+    )
+    parser.add_argument(
+        "--no-exit-on-opposite-signal",
+        dest="exit_on_opposite_signal",
+        action="store_false",
+        help="disable soft opposite-signal exits",
     )
     parser.add_argument(
         "--sleep",
@@ -704,11 +1136,76 @@ def parse_settings() -> Settings:
         help="log one-line output when signal is FLAT",
     )
     args = parser.parse_args()
+    if args.range_lookback < 2:
+        raise SystemExit("--range-lookback must be at least 2.")
+    if args.zscore_threshold <= 0:
+        raise SystemExit("--zscore-threshold must be > 0.")
+    if args.atr_period < 1:
+        raise SystemExit("--atr-period must be at least 1.")
+    if args.stop_atr_mult <= 0 or args.take_atr_mult <= 0:
+        raise SystemExit("--stop-atr-mult and --take-atr-mult must be > 0.")
+    if args.trail_atr_mult < 0:
+        raise SystemExit("--trail-atr-mult must be >= 0.")
+    if args.position_mode not in {"both", "long", "short"}:
+        raise SystemExit("--position-mode must be one of: both, long, short.")
+    if args.trend_ema_length < 0:
+        raise SystemExit("--trend-ema-length must be >= 0.")
+    if args.trend_slope_lookback < 1:
+        raise SystemExit("--trend-slope-lookback must be at least 1.")
+    if args.regime_threshold_bps < 0:
+        raise SystemExit("--regime-threshold-bps must be >= 0.")
+    if args.trend_adx_period < 1:
+        raise SystemExit("--trend-adx-period must be at least 1.")
+    if args.trend_adx_threshold < 0 or args.trend_extension_atr < 0:
+        raise SystemExit("Trend filter thresholds must be >= 0.")
+    if args.max_efficiency_ratio < 0 or args.min_mean_crosses < 0:
+        raise SystemExit("Efficiency and mean-cross filters must be >= 0.")
+    if args.volume_ma_period < 1 or args.volume_max_mult < 0:
+        raise SystemExit("Volume filter settings are invalid.")
+    if args.reentry_buffer_bps < 0:
+        raise SystemExit("--reentry-buffer-bps must be >= 0.")
+    if args.min_hold_bars < 0 or args.cooldown_bars < 0:
+        raise SystemExit("Hold/cooldown bars must be >= 0.")
+    required_lookback = max(
+        args.range_lookback + 2,
+        args.atr_period + 2,
+        args.trend_ema_length + args.trend_slope_lookback + 2
+        if args.trend_ema_length > 0
+        else 2,
+        args.trend_adx_period + 2,
+        args.volume_ma_period + 2,
+    )
+    if args.lookback < required_lookback:
+        raise SystemExit(
+            f"--lookback must be at least {required_lookback} for the selected strategy settings."
+        )
     testnet_env = os.getenv("BINANCE_TESTNET", "0") == "1"
     return Settings(
         symbol=args.symbol.upper(),
         interval=args.interval,
         lookback=args.lookback,
+        range_lookback=args.range_lookback,
+        zscore_threshold=args.zscore_threshold,
+        atr_period=args.atr_period,
+        stop_atr_mult=args.stop_atr_mult,
+        take_atr_mult=args.take_atr_mult,
+        trail_atr_mult=args.trail_atr_mult,
+        position_mode=args.position_mode,
+        trend_ema_length=args.trend_ema_length,
+        trend_slope_lookback=args.trend_slope_lookback,
+        regime_threshold_bps=args.regime_threshold_bps,
+        trend_adx_period=args.trend_adx_period,
+        trend_adx_threshold=args.trend_adx_threshold,
+        trend_extension_atr=args.trend_extension_atr,
+        max_efficiency_ratio=args.max_efficiency_ratio,
+        min_mean_crosses=args.min_mean_crosses,
+        volume_ma_period=args.volume_ma_period,
+        volume_max_mult=args.volume_max_mult,
+        reentry_buffer_bps=args.reentry_buffer_bps,
+        min_hold_bars=args.min_hold_bars,
+        cooldown_bars=args.cooldown_bars,
+        exit_on_midline=args.exit_on_midline,
+        exit_on_opposite_signal=args.exit_on_opposite_signal,
         testnet=args.testnet or testnet_env,
         live=args.live,
         loop=args.loop,
