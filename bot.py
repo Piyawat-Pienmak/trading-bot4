@@ -116,6 +116,15 @@ SIGNAL_DIAGNOSTICS_HEADERS = [
 
 DEFAULT_STRATEGY_NAME = "range_mean_reversion"
 DEFAULT_STRATEGY_VERSION = "1"
+PUBLIC_IP_ENDPOINTS = (
+    ("https://api.ipify.org", "api.ipify.org"),
+    ("https://ifconfig.me/ip", "ifconfig.me"),
+    ("https://icanhazip.com", "icanhazip.com"),
+)
+
+
+class AuthPreflightError(RuntimeError):
+    pass
 
 
 def _true_range(data: pd.DataFrame) -> pd.Series:
@@ -231,16 +240,96 @@ class FuturesBot:
             base_url=base_url,
             timeout=settings.api_timeout,
         )
-        self.filters = self._fetch_filters(settings.symbol)
+        self.base_url = base_url
         self._live_state: dict | None = None
         self._equity_cache: float | None = None
         self._cooldown_left = 0
+        self._public_ip: str | None = None
+        self._last_auth_check_at: str = ""
+        self._run_auth_preflight("startup", fail_fast=True)
+        self.filters = self._fetch_filters(settings.symbol)
         for path in (
             self.settings.trade_log,
             self.settings.event_log,
             self.settings.signal_diagnostics_log,
         ):
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    def _resolve_public_ip(self) -> Tuple[str | None, str]:
+        timeout = min(max(float(self.settings.api_timeout), 1.0), 5.0)
+        errors: List[str] = []
+        for url, label in PUBLIC_IP_ENDPOINTS:
+            try:
+                response = requests.get(
+                    url,
+                    headers={"Accept": "text/plain"},
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                ip = response.text.strip()
+                if ip:
+                    return ip, label
+                errors.append(f"{label}: empty response")
+            except requests.exceptions.RequestException as exc:
+                errors.append(f"{label}: {exc}")
+        return None, "; ".join(errors) if errors else "no public IP endpoint configured"
+
+    def _run_auth_preflight(self, context: str, fail_fast: bool = False) -> bool:
+        environment = "testnet" if self.settings.testnet else "mainnet"
+        live_mode = "live" if self.settings.live else "dry-run"
+        print(
+            f"[auth] {context} check env={environment} mode={live_mode} base_url={self.base_url}"
+        )
+
+        public_ip, ip_note = self._resolve_public_ip()
+        if public_ip:
+            if self._public_ip and self._public_ip != public_ip:
+                print(f"[auth] outbound public IP changed: {self._public_ip} -> {public_ip}")
+            else:
+                print(f"[auth] outbound public IP: {public_ip}")
+            self._public_ip = public_ip
+        else:
+            print(f"[auth] outbound public IP unavailable: {ip_note}")
+
+        try:
+            balances = self._call_with_retries(self.client.balance)
+        except ClientError as exc:
+            print(
+                f"[auth] Binance signed auth failed: code={exc.error_code} "
+                f"msg={exc.error_message}"
+            )
+            if fail_fast:
+                raise AuthPreflightError(
+                    "Binance auth preflight failed; see the auth logs above."
+                ) from exc
+            return False
+        except (requests.exceptions.RequestException, urllib3.exceptions.ProtocolError) as exc:
+            print(f"[auth] Binance signed auth failed: network error: {exc}")
+            if fail_fast:
+                raise AuthPreflightError(
+                    "Binance auth preflight failed because the signed account check did not reach Binance."
+                ) from exc
+            return False
+        except Exception as exc:
+            print(f"[auth] Binance signed auth failed: {exc}")
+            if fail_fast:
+                raise AuthPreflightError(
+                    "Binance auth preflight failed; see the auth logs above."
+                ) from exc
+            return False
+
+        usdt = next((b for b in balances if b.get("asset") == "USDT"), None)
+        wallet_balance = ""
+        if usdt is not None:
+            balance_value = usdt.get("balance", usdt.get("walletBalance", ""))
+            if balance_value not in ("", None):
+                wallet_balance = f" usdt_wallet={balance_value}"
+        self._last_auth_check_at = self._utc_now_iso()
+        print(
+            f"[auth] Binance signed auth OK at {self._last_auth_check_at}; "
+            f"USER_DATA access confirmed{wallet_balance}"
+        )
+        return True
 
     def _call_with_retries(self, func, *args, **kwargs):
         attempts = max(1, int(self.settings.api_retries))
@@ -1258,6 +1347,10 @@ class FuturesBot:
         has_position = False
         signal_label = "LONG" if direction > 0 else "SHORT" if direction < 0 else "FLAT"
         if direction != 0:
+            auth_context = "pre-trade" if self.settings.live else "signal"
+            if not self._run_auth_preflight(auth_context):
+                print("[error] auth preflight failed; skipping this signal")
+                return False
             has_position = self._has_open_position()
             if not has_position:
                 if self._cooldown_left > 0:
@@ -1723,7 +1816,11 @@ def main() -> None:
     if not api_key or not api_secret:
         raise RuntimeError("BINANCE_API_KEY/SECRET required in .env")
     settings = parse_settings()
-    bot = FuturesBot(settings=settings, api_key=api_key, api_secret=api_secret)
+    try:
+        bot = FuturesBot(settings=settings, api_key=api_key, api_secret=api_secret)
+    except AuthPreflightError as exc:
+        print(f"[error] {exc}")
+        return
     cycle = 0
     try:
         while True:
