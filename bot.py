@@ -127,6 +127,13 @@ class AuthPreflightError(RuntimeError):
     pass
 
 
+class OrderPlacementError(RuntimeError):
+    def __init__(self, leg: str, message: str) -> None:
+        super().__init__(f"{leg} order failed: {message}")
+        self.leg = leg
+        self.message = message
+
+
 def _true_range(data: pd.DataFrame) -> pd.Series:
     prev_close = data["close"].shift(1)
     tr1 = data["high"] - data["low"]
@@ -830,6 +837,113 @@ class FuturesBot:
         direction = self._signal_direction(last)
         return direction, price, atr
 
+    @staticmethod
+    def _client_error_message(exc: ClientError | Exception) -> str:
+        return str(getattr(exc, "error_message", str(exc)))
+
+    @staticmethod
+    def _safe_int(value: object) -> int:
+        if value in (None, ""):
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return 0
+
+    def _algo_request(self, http_method: str, url_path: str, payload: Dict[str, object]) -> dict:
+        return self._call_with_retries(self.client.sign_request, http_method, url_path, payload)
+
+    def _new_algo_order(self, **kwargs) -> dict:
+        return self._algo_request("POST", "/fapi/v1/algoOrder", kwargs)
+
+    def _query_algo_order(self, algo_id: int) -> dict:
+        return self._algo_request("GET", "/fapi/v1/algoOrder", {"algoId": algo_id})
+
+    def _cancel_all_algo_open_orders(self) -> dict:
+        return self._algo_request(
+            "DELETE",
+            "/fapi/v1/algoOpenOrders",
+            {"symbol": self.settings.symbol},
+        )
+
+    def _cancel_symbol_orders(self, context: str) -> None:
+        try:
+            self.client.cancel_open_orders(symbol=self.settings.symbol)
+        except (ClientError, AttributeError) as exc:
+            msg = self._client_error_message(exc)
+            note = f"cancel_open_orders failed ({context}): {msg}"
+            self._mark_live_flag("exchange_error", note)
+            self._log_event("exchange_error", note)
+            print(f"[warn] {note}")
+        try:
+            self._cancel_all_algo_open_orders()
+        except (ClientError, AttributeError) as exc:
+            msg = self._client_error_message(exc)
+            note = f"cancel_all_algo_open_orders failed ({context}): {msg}"
+            self._mark_live_flag("exchange_error", note)
+            self._log_event("exchange_error", note)
+            print(f"[warn] {note}")
+
+    def _place_protective_order(
+        self,
+        leg: str,
+        side: str,
+        order_type: str,
+        trigger_price: float,
+        qty: float,
+    ) -> dict:
+        try:
+            order = self._new_algo_order(
+                algoType="CONDITIONAL",
+                symbol=self.settings.symbol,
+                side=side,
+                type=order_type,
+                triggerPrice=str(trigger_price),
+                quantity=str(qty),
+                reduceOnly="true",
+            )
+        except ClientError as exc:
+            raise OrderPlacementError(leg, self._client_error_message(exc)) from exc
+        algo_id = self._safe_int(order.get("algoId"))
+        if algo_id <= 0:
+            raise OrderPlacementError(leg, "algo order response missing algoId")
+        return {
+            "order_id": algo_id,
+            "order_kind": "algo",
+            "order_type": order_type,
+        }
+
+    def _cleanup_failed_entry(self, exit_side: str) -> str:
+        self._cancel_symbol_orders("protective-order-cleanup")
+        remaining_qty = abs(self._position_amt())
+        if remaining_qty <= 0:
+            return "cleanup canceled open orders; no open position remained"
+        try:
+            flatten_order = self.client.new_order(
+                symbol=self.settings.symbol,
+                side=exit_side,
+                type="MARKET",
+                quantity=str(remaining_qty),
+                reduceOnly="true",
+            )
+        except ClientError as exc:
+            msg = self._client_error_message(exc)
+            raise OrderPlacementError(
+                "entry_cleanup",
+                f"protective order placement left an open position and flattening failed: {msg}",
+            ) from exc
+        flatten_order_id = self._safe_int(flatten_order.get("orderId"))
+        flatten_price = float(flatten_order.get("avgPrice") or 0.0)
+        note = "cleanup canceled open orders and flattened the unprotected position"
+        if flatten_order_id > 0:
+            note += f" with flatten_order_id={flatten_order_id}"
+        if flatten_price > 0:
+            note += f" avg_price={flatten_price:.6f}"
+        return note
+
     def _order_trades(self, order_id: int) -> List[dict]:
         try:
             trades = self.client.get_account_trades(symbol=self.settings.symbol, orderId=order_id)
@@ -860,42 +974,82 @@ class FuturesBot:
             return
         stop_id = self._live_state.get("stop_order_id")
         tp_id = self._live_state.get("tp_order_id")
+        stop_kind = str(self._live_state.get("stop_order_kind", "regular") or "regular")
+        tp_kind = str(self._live_state.get("tp_order_kind", "regular") or "regular")
         filled_id = None
         reason = None
+        exit_price = 0.0
+        exit_fee = 0.0
+        exit_exec_time = ""
 
-        def _order_status(oid: int) -> str:
+        def _regular_order(order_id: int) -> dict | None:
             try:
-                res = self.client.query_order(symbol=self.settings.symbol, orderId=oid)
-                return res.get("status", "")
+                return self.client.query_order(symbol=self.settings.symbol, orderId=order_id)
             except ClientError as exc:
-                msg = getattr(exc, "error_message", str(exc))
-                note = f"query_order failed for {oid}: {msg}"
+                msg = self._client_error_message(exc)
+                note = f"query_order failed for {order_id}: {msg}"
                 self._mark_live_flag("exchange_error", note)
                 self._log_event("exchange_error", note)
-                return ""
+                return None
+
+        def _exit_fill(order_id: int, order_kind: str) -> Tuple[int | None, float, float, str]:
+            if order_kind != "algo":
+                order = _regular_order(order_id)
+                if not order or order.get("status", "") != "FILLED":
+                    return None, 0.0, 0.0, ""
+                trades = self._order_trades(order_id)
+                filled_price, filled_fee, filled_exec_time = self._trades_summary(trades)
+                if filled_price <= 0:
+                    filled_price = float(order.get("avgPrice") or 0.0)
+                if not filled_exec_time:
+                    filled_exec_time = self._iso_from_ms(order.get("updateTime") or order.get("time"))
+                return order_id, filled_price, filled_fee, filled_exec_time
+            try:
+                algo_order = self._query_algo_order(order_id)
+            except ClientError as exc:
+                msg = self._client_error_message(exc)
+                note = f"query_algo_order failed for {order_id}: {msg}"
+                self._mark_live_flag("exchange_error", note)
+                self._log_event("exchange_error", note)
+                return None, 0.0, 0.0, ""
+            actual_order_id = self._safe_int(algo_order.get("actualOrderId"))
+            if actual_order_id <= 0:
+                return None, 0.0, 0.0, ""
+            trades = self._order_trades(actual_order_id)
+            filled_price, filled_fee, filled_exec_time = self._trades_summary(trades)
+            if filled_price > 0:
+                return actual_order_id, filled_price, filled_fee, filled_exec_time
+            order = _regular_order(actual_order_id)
+            if not order:
+                return None, 0.0, 0.0, ""
+            if order.get("status", "") != "FILLED":
+                return None, 0.0, 0.0, ""
+            filled_price = float(order.get("avgPrice") or algo_order.get("actualPrice") or 0.0)
+            filled_exec_time = self._iso_from_ms(
+                order.get("updateTime")
+                or order.get("time")
+                or algo_order.get("triggerTime")
+                or algo_order.get("updateTime")
+            )
+            return actual_order_id, filled_price, filled_fee, filled_exec_time
 
         if stop_id:
-            status = _order_status(stop_id)
-            if status == "FILLED":
-                filled_id = stop_id
+            filled_id, exit_price, exit_fee, exit_exec_time = _exit_fill(
+                self._safe_int(stop_id),
+                stop_kind,
+            )
+            if filled_id is not None:
                 reason = "hit_sl"
         if tp_id and filled_id is None:
-            status = _order_status(tp_id)
-            if status == "FILLED":
-                filled_id = tp_id
+            filled_id, exit_price, exit_fee, exit_exec_time = _exit_fill(
+                self._safe_int(tp_id),
+                tp_kind,
+            )
+            if filled_id is not None:
                 reason = "hit_tp"
         if filled_id is None:
             return
-        try:
-            self.client.cancel_open_orders(symbol=self.settings.symbol)
-        except (ClientError, AttributeError) as exc:
-            msg = getattr(exc, "error_message", str(exc))
-            note = f"cancel_open_orders failed after exit: {msg}"
-            self._mark_live_flag("exchange_error", note)
-            self._log_event("exchange_error", note)
-            print(f"[warn] cancel_open_orders failed after exit: {msg}")
-        trades = self._order_trades(filled_id)
-        exit_price, exit_fee, exit_exec_time = self._trades_summary(trades)
+        self._cancel_symbol_orders("post-exit-cleanup")
         expected_price = None
         if reason == "hit_sl":
             expected_price = float(self._live_state.get("sl_price", 0.0) or 0.0)
@@ -1029,14 +1183,7 @@ class FuturesBot:
         signal_time = self._utc_now_iso()
         signal_price = expected_price if expected_price is not None else fallback_price
         self._log_event("exit_signal", reason, price=signal_price, event_time=signal_time)
-        try:
-            self.client.cancel_open_orders(symbol=self.settings.symbol)
-        except (ClientError, AttributeError) as exc:
-            msg = getattr(exc, "error_message", str(exc))
-            note = f"cancel_open_orders failed: {msg}"
-            self._mark_live_flag("exchange_error", note)
-            self._log_event("exchange_error", note)
-            print(f"[warn] cancel_open_orders failed: {msg}")
+        self._cancel_symbol_orders("strategy-exit")
         exit_side = "SELL" if direction == "long" else "BUY"
         try:
             order = self.client.new_order(
@@ -1233,59 +1380,26 @@ class FuturesBot:
         )
         entry_order_id = int(order.get("orderId"))
         try:
-            stop_order = self.client.new_order(
-                symbol=self.settings.symbol,
-                side=exit_side,
-                type="STOP_MARKET",
-                stopPrice=str(stop_price),
-                quantity=str(qty),
-                reduceOnly="true",
+            stop_order = self._place_protective_order(
+                "stop_loss",
+                exit_side,
+                "STOP_MARKET",
+                stop_price,
+                qty,
             )
-        except ClientError as exc:
-            if "algo order" in exc.error_message.lower() or "order type not supported" in exc.error_message.lower():
-                print(
-                    f"[warn] STOP_MARKET rejected ({exc.error_message}); retrying as STOP (stop-limit)"
-                )
-                stop_order = self.client.new_order(
-                    symbol=self.settings.symbol,
-                    side=exit_side,
-                    type="STOP",
-                    timeInForce="GTC",
-                    stopPrice=str(stop_price),
-                    price=str(stop_price),
-                    quantity=str(qty),
-                    reduceOnly="true",
-                )
-            else:
-                raise
-        try:
-            tp_order = self.client.new_order(
-                symbol=self.settings.symbol,
-                side=exit_side,
-                type="TAKE_PROFIT_MARKET",
-                stopPrice=str(tp_price),
-                quantity=str(qty),
-                reduceOnly="true",
+            tp_order = self._place_protective_order(
+                "take_profit",
+                exit_side,
+                "TAKE_PROFIT_MARKET",
+                tp_price,
+                qty,
             )
-        except ClientError as exc:
-            if "algo order" in exc.error_message.lower() or "order type not supported" in exc.error_message.lower():
-                print(
-                    f"[warn] TAKE_PROFIT_MARKET rejected ({exc.error_message}); retrying as TAKE_PROFIT (stop-limit)"
-                )
-                tp_order = self.client.new_order(
-                    symbol=self.settings.symbol,
-                    side=exit_side,
-                    type="TAKE_PROFIT",
-                    timeInForce="GTC",
-                    stopPrice=str(tp_price),
-                    price=str(tp_price),
-                    quantity=str(qty),
-                    reduceOnly="true",
-                )
-            else:
-                raise
-        stop_order_id = int(stop_order.get("orderId"))
-        tp_order_id = int(tp_order.get("orderId"))
+        except OrderPlacementError as exc:
+            cleanup_note = self._cleanup_failed_entry(exit_side)
+            detail = exc.message if not cleanup_note else f"{exc.message}; {cleanup_note}"
+            raise OrderPlacementError(exc.leg, detail) from exc
+        stop_order_id = int(stop_order["order_id"])
+        tp_order_id = int(tp_order["order_id"])
         trades = self._order_trades(entry_order_id)
         entry_price, entry_fee, entry_exec_time = self._trades_summary(trades)
         if entry_price <= 0:
@@ -1296,7 +1410,9 @@ class FuturesBot:
             "direction": "long" if direction > 0 else "short",
             "entry_order_id": entry_order_id,
             "stop_order_id": stop_order_id,
+            "stop_order_kind": str(stop_order["order_kind"]),
             "tp_order_id": tp_order_id,
+            "tp_order_kind": str(tp_order["order_kind"]),
             "entry_price": entry_price,
             "entry_fee": entry_fee,
             "entry_exec_time": entry_exec_time or self._utc_now_iso(),
@@ -1467,14 +1583,22 @@ class FuturesBot:
                 f"entry_id={state['entry_order_id']} stop_id={state['stop_order_id']} "
                 f"tp_id={state['tp_order_id']} entry={state['entry_price']:.6f}"
             )
-        except ClientError as exc:
+        except OrderPlacementError as exc:
             self._log_event(
                 "exchange_error",
-                f"entry order failed: {exc.error_message}",
+                str(exc),
                 side=signal_label,
                 price=price,
             )
-            print(f"[error] order failed: {exc.error_message}")
+            print(f"[error] {exc}")
+        except ClientError as exc:
+            self._log_event(
+                "exchange_error",
+                f"entry order failed: {self._client_error_message(exc)}",
+                side=signal_label,
+                price=price,
+            )
+            print(f"[error] order failed: {self._client_error_message(exc)}")
         return False
 
 
