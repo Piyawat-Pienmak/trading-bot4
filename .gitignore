@@ -31,3 +31,9 @@ env/
 reports/
 backtest_report.html
 *.log
+
+# Private accounting evidence, database sidecars, locks, and backups
+data/accounting/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

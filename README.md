@@ -9,7 +9,7 @@ It still talks to Binance in dry-run. Exchange info and market data are always f
 - Python 3.10+ recommended.
 - Install dependencies:
   ```bash
-  pip install -r requirements.txt
+  pip install binance-futures-connector pandas python-dotenv requests matplotlib
   ```
 - Create a `.env` file and keep real keys out of git:
   ```dotenv
@@ -25,7 +25,7 @@ It still talks to Binance in dry-run. Exchange info and market data are always f
   ```
 - Dry-run a single cycle:
   ```bash
-  python bot.py --testnet
+  python bot.py --testnet --no-loop
   ```
 - Dry-run continuously:
   ```bash
@@ -60,11 +60,12 @@ Keep `BINANCE_TESTNET=1` or pass `--testnet` until the behavior, sizing, and log
 - `--loop` keeps polling instead of exiting after one check.
 - `--sleep` sets the delay between loop iterations.
 - `--log-flat` prints one-line status output even when there is no signal.
-- Completed live trades are written to `reports/trade_log.csv`.
-- Entry, exit, and error events are written to `reports/event_log.csv`.
-- Log files are capped at 1000 rows by default; set `--trade-log-limit 0` or `--event-log-limit 0` to keep all rows.
+- Live execution evidence is committed to `data/accounting/ledger.sqlite3` before order submission and after acknowledgements.
+- Trade summaries are exported to `reports/ledger_trades.csv`. Both open trades and closed trades with pending accounting are included.
+- Entry, exit, and error events are exported to `reports/ledger_events.csv`.
+- CSV reports are capped at 1000 rows by default; set `--trade-log-limit 0` or `--event-log-limit 0` to export all rows. The ledger retains all records regardless of report limits.
 
-In live mode the bot submits a market entry plus reduce-only stop and take-profit orders. If Binance rejects `STOP_MARKET` or `TAKE_PROFIT_MARKET` for the symbol/account, it falls back to `STOP` and `TAKE_PROFIT`.
+In live mode the bot submits a market entry plus reduce-only conditional stop and take-profit orders through Binance's algo-order API. If protection cannot be confirmed, the bot attempts to close its verified exposure and journals that emergency exit. An uncertain submission is queried by its saved client order ID; it is never blindly resubmitted. A candle can generate at most one entry attempt, including across restarts.
 
 ## Main options
 
@@ -84,11 +85,77 @@ python bot.py --testnet --trend-adx-threshold 25 --volume-max-mult 1.5
 python bot.py --testnet --loop --sleep 60 --trade-log reports/my_trades.csv
 ```
 
-## Logs
+## Trade accounting
 
-- `reports/trade_log.csv` stores completed live trades with signal timestamps, expected vs filled prices, stop and take-profit levels, fees, slippage, MFE/MAE, PnL, and diagnostic flags.
-- `reports/event_log.csv` stores timestamped entry, exit, and error events.
-- `reports/signal_diagnostics.csv` stores rolling signal diagnostics for the latest closed candle whenever there is a candidate, rejection, or final signal. New rows are written first and the file is capped at 1000 rows by default.
+`trade_ledger.py` stores trades, order intents, raw fills, income, events, account snapshots, and history coverage in SQLite. `trade_reconciliation.py` checks those records against Binance using read-only requests. `bot.py` uses the order journal for every entry, protective order, strategy exit, and emergency closure. `accounting.py` provides maintenance commands without running the trading loop.
+
+The bot reconciles at startup and on every cycle. It restores position metadata, trailing-stop state and cooldown state. If a process dies after an order executes, reconciliation queries the persisted client ID and retrieves the actual fills. If an entry is recovered without confirmed protection, the live bot attempts an emergency closure of its verified quantity. Cancellation targets only the tracked trade's protective orders. `accounting.py reconcile` itself never submits or cancels orders.
+
+The current execution model requires one-way mode and exclusive ownership of the traded symbol's position. A pre-existing or manually changed position is reported as unresolved and blocks new entries. An operator can explicitly link a verified manual closing order to its trade. The bot does not guess ownership from matching price or time alone.
+
+### Confirmed versus pending results
+
+Each trade has separate `execution_status` and `accounting_status` fields. An executed closure can be `closed` while its accounting is still `pending`. A blank P&L or fee means unavailable, not zero. Only `accounting_status=complete` rows are ready to include in a confirmed performance total; always report the pending/unresolved count alongside that total.
+
+Confirmed net P&L is the sum of Binance fill `realizedPnl`, minus entry/exit commissions, plus signed funding payments. Commission and realized-PnL records from income history are retained for audit but are not counted again. Transfers and other account income remain separate. Partial fills are matched by quantity, and duplicate fill IDs cannot create additional profit or fees. Conflicting duplicate evidence is rejected rather than overwritten.
+
+Accounting remains pending when fills, fees, order outcomes, or history coverage are incomplete. Funding coverage is checked with a 60-second settlement delay and a rolling overlap to retrieve delayed records. Unrelated orders during the trade or overlapping trades prevent automatic funding attribution. Fees are retained by their original currency; non-USDT commissions requiring conversion leave net P&L pending. No exchange rate is invented. MFE/MAE remain candle-based observations, not exchange-certified tick history.
+
+### Storage and account identity
+
+- Default ledger: `data/accounting/ledger.sqlite3`; override with `--ledger-path` or `BOT_LEDGER_PATH`.
+- Automatic daily SQLite backups: `data/accounting/backups/`. Backups also work while WAL mode is active.
+- Account namespaces include the exchange base URL and a hash of the API key. No API secret is stored. Set `BOT_ACCOUNT_ID` / `--account-id` to a stable, unique account label before first use if you need continuity across API-key rotations. Reuse it only for that same account. Mainnet and testnet remain separate.
+- One bot or maintenance writer may use an account namespace at a time. Stop the bot before imports, explicit order linking, or standalone reconciliation. Use separate report paths if you operate multiple account namespaces.
+- CSV exports use temporary files and atomic replacement. If an overridden report path contains an older CSV, a copy with a `.legacy-<hash>.csv` suffix is preserved before replacement. A report containing another account scope is not overwritten. Their row limits do not remove ledger evidence. Dry-run does not create or reconcile a live ledger.
+- `reports/signal_diagnostics.csv` remains a separate rolling signal diagnostic log; it is not a record of executed trades.
+
+### Preserve and investigate older CSV history
+
+The previous `reports/trade_log.csv` and `reports/event_log.csv` are not overwritten by the new defaults. Import them into an unassigned namespace:
+
+```bash
+python accounting.py import-legacy
+python accounting.py backup data/accounting/backups/manual-backup.sqlite3
+python accounting.py list-scopes
+```
+
+The import preserves original rows and writes `reports/accounting/legacy_review.csv`. Previously reported totals appear as `legacy_reported_net_pnl`; confirmed `net_pnl` stays blank. Missing exits and emergency closures are listed separately. Repeating an import does not duplicate records. Old records have no account/testnet identity, so they are not automatically assigned to the current API key.
+
+Ordinary Binance trade and income history endpoints currently document a three-month lookback. Older gaps require historical exports and may remain unresolved if evidence is unavailable. Use Binance-format JSON arrays or CSVs whose field names match the API (`id`, `orderId`, `symbol`, `qty`, `price`, `side`, `time`, `commission`, `commissionAsset`, `realizedPnl`; income uses `incomeType`, `tranId`, `asset`, `income`, `time`, `symbol`). Convert differently formatted exchange downloads to those named fields without replacing missing values with zero.
+
+### Read-only reconciliation and exports
+
+These commands require the bot to be stopped. Reconciliation uses `.env` credentials and the same account label/environment as the bot, and prints the exact scope for subsequent commands:
+
+```bash
+python accounting.py reconcile --symbol DOGEUSDT --testnet
+python accounting.py --scope 'EXACT_SCOPE_FROM_RECONCILE' export --output-dir reports/accounting/testnet
+```
+
+Exports contain trades, order-to-trade mappings, attributed/unassigned fills, income, account snapshots, events, and legacy review rows. Never combine mainnet, testnet, or different accounts into one performance total.
+
+To repair history after verifying account and order ownership, register a known entry and explicitly attach its exits. Replace placeholders with verified values; each command below is a separate step:
+
+```bash
+python accounting.py --scope 'EXACT_SCOPE' adopt-entry --order-id ENTRY_ID --symbol DOGEUSDT --direction long --time '2026-08-01T12:00:00+00:00'
+python accounting.py --scope 'EXACT_SCOPE' link-order --trade-id RETURNED_TRADE_ID --order-id EXIT_ID --role exit
+python accounting.py --scope 'EXACT_SCOPE' import-orders verified_orders.json
+python accounting.py --scope 'EXACT_SCOPE' import-fills verified_fills.json
+python accounting.py --scope 'EXACT_SCOPE' import-income verified_income.json
+```
+
+`adopt-entry` only records the relationship; it does not place an order. Imported order evidence must include `symbol`, `orderId`, `status`, and `executedQty`. Full historical coverage can be explicitly certified on both `import-fills` and `import-income` with `--complete-from ISO_TIME --complete-through ISO_TIME --symbol DOGEUSDT`, but only after independently verifying each export covers the entire interval. Ordinary coverage is established by reconciliation. Imports and account snapshots do not by themselves prove a complete history.
+
+API references: [account trades and order lookup](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/trade), [income and historical exports](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/account).
+
+### Offline tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Tests use a fake exchange and temporary databases. They cover execution before a crash/timeout, restart recovery, emergency closure, manual exit attribution, partial fills, delayed fees/funding, duplicate imports, pagination, account isolation, backups, and dry-run behavior. They never connect to Binance or place real orders.
 
 ## Backtesting
 

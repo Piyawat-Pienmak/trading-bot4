@@ -3,7 +3,8 @@ import csv
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import pandas as pd
@@ -12,6 +13,9 @@ import urllib3
 from binance.error import ClientError
 from binance.um_futures import UMFutures
 from dotenv import load_dotenv
+
+from trade_ledger import TradeLedger, account_scope, decimal, now_ms, TERMINAL, ZERO
+from trade_reconciliation import OrderJournal, OrderOutcomeUnknown, Reconciler
 
 load_dotenv()
 
@@ -221,8 +225,10 @@ class Settings:
     base_url: str | None = None
     loop: bool = True
     poll_seconds: int = 300
-    trade_log: str = "reports/trade_log.csv"
-    event_log: str = "reports/event_log.csv"
+    trade_log: str = "reports/ledger_trades.csv"
+    event_log: str = "reports/ledger_events.csv"
+    ledger_path: str = "data/accounting/ledger.sqlite3"
+    account_id: str = ""
     signal_diagnostics_log: str = "reports/signal_diagnostics.csv"
     trade_log_limit: int = 1000
     event_log_limit: int = 1000
@@ -255,6 +261,19 @@ class FuturesBot:
         self._cooldown_left = 0
         self._public_ip: str | None = None
         self._last_auth_check_at: str = ""
+        self.ledger = None
+        self.reconciler = None
+        self.journal = None
+        if settings.live:
+            self.ledger = TradeLedger(settings.ledger_path, account_scope(base_url, api_key, settings.account_id))
+            self.ledger.acquire_writer_lock()
+            self.journal = OrderJournal(self.ledger, self.client)
+            self.reconciler = Reconciler(self.ledger, self.client, settings.symbol)
+            self._cooldown_left = self.ledger.setting("cooldown:" + settings.symbol, 0)
+            backup_day = _utc_now().strftime("%Y-%m-%d")
+            if self.ledger.setting("backup_day") != backup_day:
+                self.ledger.backup(Path(settings.ledger_path).parent / "backups" / f"ledger-{backup_day}.sqlite3")
+                self.ledger.set_setting("backup_day", backup_day)
         self._run_auth_preflight("startup", fail_fast=True)
         self.filters = self._fetch_filters(settings.symbol)
         for path in (
@@ -263,6 +282,9 @@ class FuturesBot:
             self.settings.signal_diagnostics_log,
         ):
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        if settings.live:
+            self._process_live_exit()
+            self._export_accounting()
 
     def _resolve_public_ip(self) -> Tuple[str | None, str]:
         timeout = min(max(float(self.settings.api_timeout), 1.0), 5.0)
@@ -735,20 +757,16 @@ class FuturesBot:
         price_value: object = ""
         if price is not None and not math.isnan(price) and not math.isinf(price):
             price_value = round(float(price), 8)
-        self._append_capped_csv(
-            self.settings.event_log,
-            EVENT_LOG_HEADERS,
-            {
-                "event_time": event_time or self._utc_now_iso(),
-                "trade_id": trade_id or str(state.get("trade_id", "") or ""),
-                "event_type": event_type,
-                "symbol": self.settings.symbol,
-                "side": resolved_side,
-                "price": price_value,
-                "details": details,
-            },
-            self.settings.event_log_limit,
-        )
+        row = {
+            "event_time": event_time or self._utc_now_iso(),
+            "trade_id": trade_id or str(state.get("trade_id", "") or ""),
+            "event_type": event_type, "symbol": self.settings.symbol,
+            "side": resolved_side, "price": price_value, "details": details,
+        }
+        if self.ledger:
+            self.ledger.event(row)
+        else:
+            self._append_capped_csv(self.settings.event_log, EVENT_LOG_HEADERS, row, self.settings.event_log_limit)
 
     def _log_signal_diagnostic(self, row: pd.Series) -> None:
         pre_regime_signal = int(row.get("pre_regime_signal", 0) or 0)
@@ -853,367 +871,143 @@ class FuturesBot:
             except (TypeError, ValueError):
                 return 0
 
-    def _algo_request(self, http_method: str, url_path: str, payload: Dict[str, object]) -> dict:
-        return self._call_with_retries(self.client.sign_request, http_method, url_path, payload)
-
-    def _new_algo_order(self, **kwargs) -> dict:
-        return self._algo_request("POST", "/fapi/v1/algoOrder", kwargs)
-
-    def _query_algo_order(self, algo_id: int) -> dict:
-        return self._algo_request("GET", "/fapi/v1/algoOrder", {"algoId": algo_id})
-
-    def _cancel_all_algo_open_orders(self) -> dict:
-        return self._algo_request(
-            "DELETE",
-            "/fapi/v1/algoOpenOrders",
-            {"symbol": self.settings.symbol},
-        )
-
     def _cancel_symbol_orders(self, context: str) -> None:
-        try:
-            self.client.cancel_open_orders(symbol=self.settings.symbol)
-        except (ClientError, AttributeError) as exc:
-            msg = self._client_error_message(exc)
-            note = f"cancel_open_orders failed ({context}): {msg}"
-            self._mark_live_flag("exchange_error", note)
-            self._log_event("exchange_error", note)
-            print(f"[warn] {note}")
-        try:
-            self._cancel_all_algo_open_orders()
-        except (ClientError, AttributeError) as exc:
-            msg = self._client_error_message(exc)
-            note = f"cancel_all_algo_open_orders failed ({context}): {msg}"
-            self._mark_live_flag("exchange_error", note)
-            self._log_event("exchange_error", note)
-            print(f"[warn] {note}")
+        # Cancel only this trade's protection. Other account orders are not ours.
+        if not self.ledger or not self._live_state:
+            return
+        for order in self.ledger.orders(self._live_state["trade_id"]):
+            if order["role"] not in {"stop_loss", "take_profit"} or order["status"] in TERMINAL:
+                continue
+            try:
+                if order["kind"] == "algo":
+                    key = {"algoId": order["exchange_id"]} if order["exchange_id"] else {"clientAlgoId": order["client_id"]}
+                    self.client.sign_request("DELETE", "/fapi/v1/algoOrder", key)
+                    # Query again during reconciliation: cancellation can race a trigger.
+                else:
+                    key = {"orderId": order["exchange_id"]} if order["exchange_id"] else {"origClientOrderId": order["client_id"]}
+                    response = self.client.cancel_order(symbol=self.settings.symbol, **key)
+                    self.ledger.acknowledge(order["client_id"], response)
+            except Exception as exc:
+                self._log_event("exchange_error", f"cancel protection ({context}): {exc}")
 
-    def _place_protective_order(
-        self,
-        leg: str,
-        side: str,
-        order_type: str,
-        trigger_price: float,
-        qty: float,
-    ) -> dict:
+    def _place_protective_order(self, leg, side, order_type, trigger_price, qty) -> dict:
         try:
-            order = self._new_algo_order(
-                algoType="CONDITIONAL",
-                symbol=self.settings.symbol,
-                side=side,
-                type=order_type,
-                triggerPrice=str(trigger_price),
-                quantity=str(qty),
-                reduceOnly="true",
-            )
-        except ClientError as exc:
-            raise OrderPlacementError(leg, self._client_error_message(exc)) from exc
-        algo_id = self._safe_int(order.get("algoId"))
-        if algo_id <= 0:
-            raise OrderPlacementError(leg, "algo order response missing algoId")
-        return {
-            "order_id": algo_id,
-            "order_kind": "algo",
-            "order_type": order_type,
-        }
+            response = self.journal.submit(self._live_state["trade_id"], leg, {
+                "symbol": self.settings.symbol, "algoType": "CONDITIONAL", "side": side,
+                "type": order_type, "triggerPrice": str(trigger_price),
+                "quantity": str(qty), "reduceOnly": "true",
+            }, kind="algo")
+        except Exception as exc:
+            raise OrderPlacementError(leg, str(exc)) from exc
+        prefix = "stop" if leg == "stop_loss" else "tp"
+        self._live_state[prefix + "_order_id"] = str(response["algoId"])
+        self._live_state[prefix + "_order_kind"] = "algo"
+        self._persist_live_state()
+        return {"order_id": str(response["algoId"]), "order_kind": "algo", "order_type": order_type}
+
+    def _persist_live_state(self):
+        if self.ledger:
+            if self._live_state:
+                self.ledger.save_state(self._live_state)
+            self.ledger.set_setting("cooldown:" + self.settings.symbol, self._cooldown_left)
+
+    def _export_accounting(self):
+        if self.ledger:
+            backup_day = _utc_now().strftime("%Y-%m-%d")
+            if self.ledger.setting("backup_day") != backup_day:
+                self.ledger.backup(Path(self.settings.ledger_path).parent / "backups" / f"ledger-{backup_day}.sqlite3")
+                self.ledger.set_setting("backup_day", backup_day)
+            self.ledger.export(self.settings.trade_log, self.settings.event_log,
+                               self.settings.trade_log_limit, self.settings.event_log_limit)
 
     def _cleanup_failed_entry(self, exit_side: str) -> str:
-        self._cancel_symbol_orders("protective-order-cleanup")
-        remaining_qty = abs(self._position_amt())
-        if remaining_qty <= 0:
-            return "cleanup canceled open orders; no open position remained"
-        try:
-            flatten_order = self.client.new_order(
-                symbol=self.settings.symbol,
-                side=exit_side,
-                type="MARKET",
-                quantity=str(remaining_qty),
-                reduceOnly="true",
-            )
-        except ClientError as exc:
-            msg = self._client_error_message(exc)
-            raise OrderPlacementError(
-                "entry_cleanup",
-                f"protective order placement left an open position and flattening failed: {msg}",
-            ) from exc
-        flatten_order_id = self._safe_int(flatten_order.get("orderId"))
-        flatten_price = float(flatten_order.get("avgPrice") or 0.0)
-        note = "cleanup canceled open orders and flattened the unprotected position"
-        if flatten_order_id > 0:
-            note += f" with flatten_order_id={flatten_order_id}"
-        if flatten_price > 0:
-            note += f" avg_price={flatten_price:.6f}"
-        return note
-
-    def _order_trades(self, order_id: int) -> List[dict]:
-        try:
-            trades = self.client.get_account_trades(symbol=self.settings.symbol, orderId=order_id)
-        except ClientError:
-            return []
-        return trades or []
-
-    def _trades_summary(self, trades: List[dict]) -> Tuple[float, float, str]:
-        if not trades:
-            return 0.0, 0.0, ""
-        total_qty = 0.0
-        total_quote = 0.0
-        total_fee = 0.0
-        latest_trade_time = 0.0
-        for t in trades:
-            qty = float(t.get("qty", 0) or 0.0)
-            price = float(t.get("price", 0) or 0.0)
-            fee = float(t.get("commission", 0) or 0.0)
-            total_qty += qty
-            total_quote += qty * price
-            total_fee += fee
-            latest_trade_time = max(latest_trade_time, float(t.get("time", 0) or 0.0))
-        avg_price = (total_quote / total_qty) if total_qty > 0 else 0.0
-        return avg_price, total_fee, self._iso_from_ms(latest_trade_time)
+        if not self._live_state:
+            return "cleanup pending: no tracked trade"
+        # Cancel an incompletely filled entry before closing its executed portion.
+        for order in self.ledger.orders(self._live_state["trade_id"]):
+            if order["role"] == "entry" and order["status"] not in TERMINAL:
+                if not order["exchange_id"]:
+                    return "cleanup pending: entry outcome must be reconciled"
+                try:
+                    result = self.client.cancel_order(symbol=self.settings.symbol, orderId=order["exchange_id"])
+                    self.ledger.acknowledge(order["client_id"], result)
+                except Exception as exc:
+                    self._log_event("exchange_error", f"entry cancellation pending: {exc}")
+                    return "cleanup pending: entry cancellation must be reconciled"
+        closed = self._market_exit_live_position("entry_cleanup", float(self._live_state.get("entry_price", 0) or 0))
+        return "cleanup exit submitted; fills pending reconciliation" if closed else "cleanup pending reconciliation"
 
     def _process_live_exit(self) -> None:
-        if not self.settings.live or not self._live_state:
+        if not self.settings.live or not self.ledger:
             return
-        stop_id = self._live_state.get("stop_order_id")
-        tp_id = self._live_state.get("tp_order_id")
-        stop_kind = str(self._live_state.get("stop_order_kind", "regular") or "regular")
-        tp_kind = str(self._live_state.get("tp_order_kind", "regular") or "regular")
-        filled_id = None
-        reason = None
-        exit_price = 0.0
-        exit_fee = 0.0
-        exit_exec_time = ""
+        self._persist_live_state()
+        self.reconciler.sync()
+        # Discover closures even when this process never saw the position open.
+        for trade in self.ledger.trades(self.settings.symbol):
+            summary = self.ledger.summary(trade["trade_id"])
+            if summary["execution_status"] == "closed":
+                state = self.ledger.state(trade["trade_id"])
+                self._live_state = state
+                self._cancel_symbol_orders("post-exit-cleanup")
+                if not state.get("closure_seen"):
+                    self.ledger.event({"event_time": summary["exit_exec_time"], "trade_id": trade["trade_id"],
+                                       "event_type": "exit_exec", "symbol": self.settings.symbol,
+                                       "side": state.get("side", ""), "price": summary["exit_price_filled"],
+                                       "details": "Position closed; see trade report for accounting status"},
+                                      event_id="closed:" + trade["trade_id"])
+                    self._cooldown_left = max(0, self.settings.cooldown_bars)
+                    state["closure_seen"] = True
+                    self.ledger.save_state(state)
+        states = self.reconciler.active_states()
+        self._live_state = states[0] if len(states) == 1 else None
+        if len(states) > 1:
+            self._log_event("reconciliation_error", "Multiple unresolved trades; new entries blocked")
+        if self._live_state and self.reconciler.ready:
+            orders = self.ledger.orders(self._live_state["trade_id"])
+            entry_qty, exit_qty, uncertain = self.ledger.exposure(self._live_state["trade_id"])
+            protection = {o["role"] for o in orders if o["kind"] == "algo" and o["status"] == "NEW"}
+            pending_exit = any(o["role"] in {"exit", "cleanup"} and o["status"] not in TERMINAL for o in orders)
+            if entry_qty > exit_qty and not pending_exit and protection != {"stop_loss", "take_profit"}:
+                self._cleanup_failed_entry("SELL" if self._live_state["direction"] == "long" else "BUY")
+        self._persist_live_state()
 
-        def _regular_order(order_id: int) -> dict | None:
-            try:
-                return self.client.query_order(symbol=self.settings.symbol, orderId=order_id)
-            except ClientError as exc:
-                msg = self._client_error_message(exc)
-                note = f"query_order failed for {order_id}: {msg}"
-                self._mark_live_flag("exchange_error", note)
-                self._log_event("exchange_error", note)
-                return None
-
-        def _exit_fill(order_id: int, order_kind: str) -> Tuple[int | None, float, float, str]:
-            if order_kind != "algo":
-                order = _regular_order(order_id)
-                if not order or order.get("status", "") != "FILLED":
-                    return None, 0.0, 0.0, ""
-                trades = self._order_trades(order_id)
-                filled_price, filled_fee, filled_exec_time = self._trades_summary(trades)
-                if filled_price <= 0:
-                    filled_price = float(order.get("avgPrice") or 0.0)
-                if not filled_exec_time:
-                    filled_exec_time = self._iso_from_ms(order.get("updateTime") or order.get("time"))
-                return order_id, filled_price, filled_fee, filled_exec_time
-            try:
-                algo_order = self._query_algo_order(order_id)
-            except ClientError as exc:
-                msg = self._client_error_message(exc)
-                note = f"query_algo_order failed for {order_id}: {msg}"
-                self._mark_live_flag("exchange_error", note)
-                self._log_event("exchange_error", note)
-                return None, 0.0, 0.0, ""
-            actual_order_id = self._safe_int(algo_order.get("actualOrderId"))
-            if actual_order_id <= 0:
-                return None, 0.0, 0.0, ""
-            trades = self._order_trades(actual_order_id)
-            filled_price, filled_fee, filled_exec_time = self._trades_summary(trades)
-            if filled_price > 0:
-                return actual_order_id, filled_price, filled_fee, filled_exec_time
-            order = _regular_order(actual_order_id)
-            if not order:
-                return None, 0.0, 0.0, ""
-            if order.get("status", "") != "FILLED":
-                return None, 0.0, 0.0, ""
-            filled_price = float(order.get("avgPrice") or algo_order.get("actualPrice") or 0.0)
-            filled_exec_time = self._iso_from_ms(
-                order.get("updateTime")
-                or order.get("time")
-                or algo_order.get("triggerTime")
-                or algo_order.get("updateTime")
-            )
-            return actual_order_id, filled_price, filled_fee, filled_exec_time
-
-        if stop_id:
-            filled_id, exit_price, exit_fee, exit_exec_time = _exit_fill(
-                self._safe_int(stop_id),
-                stop_kind,
-            )
-            if filled_id is not None:
-                reason = "hit_sl"
-        if tp_id and filled_id is None:
-            filled_id, exit_price, exit_fee, exit_exec_time = _exit_fill(
-                self._safe_int(tp_id),
-                tp_kind,
-            )
-            if filled_id is not None:
-                reason = "hit_tp"
-        if filled_id is None:
-            return
-        self._cancel_symbol_orders("post-exit-cleanup")
-        expected_price = None
-        if reason == "hit_sl":
-            expected_price = float(self._live_state.get("sl_price", 0.0) or 0.0)
-        elif reason == "hit_tp":
-            expected_price = float(self._live_state.get("tp_price", 0.0) or 0.0)
-        self._log_live_exit(
-            exit_price,
-            exit_fee,
-            reason or "",
-            exit_exec_time=exit_exec_time,
-            exit_signal_time=exit_exec_time,
-            exit_expected_price=expected_price if expected_price and expected_price > 0 else None,
-        )
-
-    def _log_live_exit(
-        self,
-        exit_price: float,
-        exit_fee: float,
-        reason: str,
-        exit_exec_time: str = "",
-        exit_signal_time: str = "",
-        exit_expected_price: float | None = None,
-    ) -> None:
-        if not self._live_state:
-            return
-        state = self._live_state
-        direction = state.get("direction", "")
-        entry_price = float(state.get("entry_price", 0.0) or 0.0)
-        entry_fee = float(state.get("entry_fee", 0.0) or 0.0)
-        size = float(state.get("size", 0.0) or 0.0)
-        if exit_price <= 0:
-            exit_price = entry_price
-        entry_expected_price = float(state.get("entry_price_expected", entry_price) or entry_price)
-        if exit_expected_price is None or exit_expected_price <= 0:
-            exit_expected_price = exit_price
-        gross_pnl = (exit_price - entry_price) * size if direction == "long" else (entry_price - exit_price) * size
-        fees = entry_fee + exit_fee
-        net_pnl = gross_pnl - fees
-        risk_amount = abs(entry_price - float(state.get("sl_price", entry_price) or entry_price)) * size
-        entry_exec_ts = str(state.get("entry_exec_time", state.get("timestamp_entry", "")) or "")
-        exit_signal_ts = exit_signal_time or exit_exec_time or self._utc_now_iso()
-        exit_exec_ts = exit_exec_time or exit_signal_ts
-        equity_after = self._wallet_equity()
-        self._equity_cache = equity_after
-        trade_row = {
-            "trade_id": state.get("trade_id", state.get("entry_order_id", "")),
-            "strategy_name": self.settings.strategy_name,
-            "strategy_version": self.settings.strategy_version,
-            "symbol": self.settings.symbol,
-            "interval": self.settings.interval,
-            "side": state.get("side", direction.upper()),
-            "entry_signal_time": state.get("entry_signal_time", ""),
-            "entry_exec_time": entry_exec_ts,
-            "exit_signal_time": exit_signal_ts,
-            "exit_exec_time": exit_exec_ts,
-            "entry_reason": state.get("entry_reason", ""),
-            "exit_reason": reason or "",
-            "market_regime": state.get("market_regime", ""),
-            "signal_open": state.get("signal_open", ""),
-            "signal_high": state.get("signal_high", ""),
-            "signal_low": state.get("signal_low", ""),
-            "signal_close": state.get("signal_close", ""),
-            "entry_price_expected": round(entry_expected_price, 8) if entry_expected_price > 0 else "",
-            "entry_price_filled": round(entry_price, 8) if entry_price > 0 else "",
-            "exit_price_expected": round(exit_expected_price, 8) if exit_expected_price > 0 else "",
-            "exit_price_filled": round(exit_price, 8) if exit_price > 0 else "",
-            "position_size": size,
-            "notional_usdt": state.get("notional_usdt", round(entry_price * size, 8)),
-            "leverage": state.get("leverage", self.settings.leverage),
-            "stop_loss_price": state.get("sl_price", ""),
-            "take_profit_price": state.get("tp_price", ""),
-            "trailing_stop_price": state.get("trailing_stop_price", ""),
-            "ema_value": state.get("ema_value", ""),
-            "atr_value": state.get("atr_value", ""),
-            "adx_value": state.get("adx_value", ""),
-            "volume": state.get("volume", ""),
-            "volume_ma": state.get("volume_ma", ""),
-            "breakout_level": state.get("breakout_level", ""),
-            "zscore": state.get("zscore", ""),
-            "fee_entry": round(entry_fee, 8),
-            "fee_exit": round(exit_fee, 8),
-            "slippage_entry": round(entry_price - entry_expected_price, 8) if entry_expected_price > 0 else "",
-            "slippage_exit": round(exit_price - exit_expected_price, 8) if exit_expected_price > 0 else "",
-            "max_unrealized_profit": state.get("max_unrealized_profit", 0.0),
-            "max_unrealized_loss": state.get("max_unrealized_loss", 0.0),
-            "max_favorable_excursion": state.get("max_favorable_excursion", 0.0),
-            "max_adverse_excursion": state.get("max_adverse_excursion", 0.0),
-            "gross_pnl": round(gross_pnl, 8),
-            "net_pnl": round(net_pnl, 8),
-            "r_multiple": round(net_pnl / risk_amount, 8) if risk_amount > 0 else "",
-            "bars_held": int(state.get("bars_held", 0) or 0),
-            "signal_valid": int(state.get("signal_valid", 1) or 0),
-            "missed_trade": int(state.get("missed_trade", 0) or 0),
-            "wrong_trade": int(state.get("wrong_trade", 0) or 0),
-            "exchange_error": int(state.get("exchange_error", 0) or 0),
-            "data_error": int(state.get("data_error", 0) or 0),
-            "server_error": int(state.get("server_error", 0) or 0),
-            "manual_intervention": int(state.get("manual_intervention", 0) or 0),
-            "notes": state.get("notes", ""),
-        }
-        self._append_capped_csv(
-            self.settings.trade_log,
-            TRADE_LOG_HEADERS,
-            trade_row,
-            self.settings.trade_log_limit,
-        )
-        self._log_event(
-            "exit_exec",
-            f"{reason or 'exit'} net_pnl={net_pnl:.8f}",
-            trade_id=str(trade_row["trade_id"]),
-            side=str(trade_row["side"]),
-            price=exit_price,
-            event_time=exit_exec_ts,
-        )
-        print(f"[live] exit detected ({reason}); logged trade with net PnL {net_pnl:.6f}")
-        self._live_state = None
-        self._cooldown_left = max(0, int(self.settings.cooldown_bars))
-
-    def _market_exit_live_position(
-        self,
-        reason: str,
-        fallback_price: float,
-        expected_price: float | None = None,
-    ) -> bool:
+    def _market_exit_live_position(self, reason: str, fallback_price: float,
+                                   expected_price: float | None = None) -> bool:
         if not self.settings.live or not self._live_state:
             return False
-        direction = self._live_state.get("direction", "")
-        qty = abs(self._position_amt())
+        trade_id = self._live_state["trade_id"]
+        orders = self.ledger.orders(trade_id)
+        if any(o["role"] in {"exit", "cleanup"} and o["status"] not in TERMINAL for o in orders):
+            return False
+        entered, exited, uncertain = self.ledger.exposure(trade_id)
+        if any(o["role"] == "entry" and o["status"] not in TERMINAL for o in orders):
+            return False
+        qty = entered - exited
         if qty <= 0:
             return False
-        signal_time = self._utc_now_iso()
-        signal_price = expected_price if expected_price is not None else fallback_price
-        self._log_event("exit_signal", reason, price=signal_price, event_time=signal_time)
-        self._cancel_symbol_orders("strategy-exit")
-        exit_side = "SELL" if direction == "long" else "BUY"
-        try:
-            order = self.client.new_order(
-                symbol=self.settings.symbol,
-                side=exit_side,
-                type="MARKET",
-                quantity=str(qty),
-                reduceOnly="true",
-            )
-        except ClientError as exc:
-            note = f"strategy exit order failed: {exc.error_message}"
-            self._mark_live_flag("exchange_error", note)
-            self._log_event("exchange_error", note, price=fallback_price, event_time=signal_time)
-            print(f"[error] strategy exit order failed: {exc.error_message}")
+        positions = self.client.get_position_risk(symbol=self.settings.symbol)
+        if any(p.get("positionSide", "BOTH") != "BOTH" for p in positions if p.get("symbol") == self.settings.symbol):
+            self._log_event("reconciliation_error", "Exit requires a reconciled one-way position")
             return False
-        exit_order_id = int(order.get("orderId"))
-        trades = self._order_trades(exit_order_id)
-        exit_price, exit_fee, exit_exec_time = self._trades_summary(trades)
-        if exit_price <= 0:
-            exit_price = float(order.get("avgPrice") or fallback_price)
-        if not exit_exec_time:
-            exit_exec_time = self._iso_from_ms(order.get("updateTime") or order.get("time"))
-        self._log_live_exit(
-            exit_price,
-            exit_fee,
-            reason,
-            exit_exec_time=exit_exec_time,
-            exit_signal_time=signal_time,
-            exit_expected_price=signal_price,
-        )
+        position = sum((decimal(p.get("positionAmt", 0)) for p in positions if p.get("symbol") == self.settings.symbol), ZERO)
+        expected_position = qty if self._live_state["direction"] == "long" else -qty
+        if position != expected_position:
+            self._log_event("reconciliation_error", "Exchange position differs from tracked quantity; exit ownership unresolved")
+            return False
+        self._live_state.update({"exit_reason": reason, "exit_signal_time": self._utc_now_iso(),
+                                 "exit_price_expected": expected_price if expected_price is not None else fallback_price})
+        self._persist_live_state()
+        self._log_event("exit_signal", reason, price=fallback_price)
+        self._cancel_symbol_orders(reason)
+        try:
+            self.journal.submit(trade_id, "cleanup" if reason == "entry_cleanup" else "exit", {
+                "symbol": self.settings.symbol,
+                "side": "SELL" if position > 0 else "BUY", "type": "MARKET",
+                "quantity": str(qty), "reduceOnly": "true",
+            })
+        except Exception as exc:
+            self._log_event("exchange_error", f"{reason}: {exc}")
+            return False
         return True
 
     def _bars_held(self, df: pd.DataFrame) -> int:
@@ -1362,65 +1156,36 @@ class FuturesBot:
                 return pos_amt
         return 0.0
 
-    def _place_orders(
-        self,
-        direction: int,
-        qty: float,
-        stop_price: float,
-        tp_price: float,
-        price: float,
-    ) -> dict:
+    def _place_orders(self, direction, qty, stop_price, tp_price, price, metadata=None) -> dict:
         side = "BUY" if direction > 0 else "SELL"
-        exit_side = "SELL" if direction > 0 else "BUY"
-        order = self.client.new_order(
-            symbol=self.settings.symbol,
-            side=side,
-            type="MARKET",
-            quantity=str(qty),
-        )
-        entry_order_id = int(order.get("orderId"))
+        state = {**(metadata or {}), "entry_price": price, "size": 0,
+                 "sl_price": stop_price, "tp_price": tp_price, "side": "LONG" if direction > 0 else "SHORT",
+                 "settings": asdict(self.settings), "pnl_asset": "USDT"}
+        self._live_state = self.ledger.create_trade(self.settings.symbol, "long" if direction > 0 else "short", state)
+        self.ledger.set_setting("last_signal:" + self.settings.symbol + ":" + self.settings.interval,
+                                state.get("entry_signal_open_time"))
+        self._log_event("entry_signal", state.get("entry_reason", ""), price=price)
         try:
-            stop_order = self._place_protective_order(
-                "stop_loss",
-                exit_side,
-                "STOP_MARKET",
-                stop_price,
-                qty,
-            )
-            tp_order = self._place_protective_order(
-                "take_profit",
-                exit_side,
-                "TAKE_PROFIT_MARKET",
-                tp_price,
-                qty,
-            )
+            order = self.journal.submit(self._live_state["trade_id"], "entry", {
+                "symbol": self.settings.symbol, "side": side, "type": "MARKET",
+                "quantity": str(qty), "newOrderRespType": "RESULT",
+            })
+        except Exception as exc:
+            raise OrderPlacementError("entry", str(exc)) from exc
+        self._live_state.update({"entry_order_id": str(order["orderId"]),
+                                 "entry_price": float(order.get("avgPrice") or price),
+                                 "size": float(order.get("executedQty") or 0)})
+        self._persist_live_state()
+        try:
+            exit_side = "SELL" if direction > 0 else "BUY"
+            self._place_protective_order("stop_loss", exit_side, "STOP_MARKET", stop_price, qty)
+            self._place_protective_order("take_profit", exit_side, "TAKE_PROFIT_MARKET", tp_price, qty)
         except OrderPlacementError as exc:
-            cleanup_note = self._cleanup_failed_entry(exit_side)
-            detail = exc.message if not cleanup_note else f"{exc.message}; {cleanup_note}"
-            raise OrderPlacementError(exc.leg, detail) from exc
-        stop_order_id = int(stop_order["order_id"])
-        tp_order_id = int(tp_order["order_id"])
-        trades = self._order_trades(entry_order_id)
-        entry_price, entry_fee, entry_exec_time = self._trades_summary(trades)
-        if entry_price <= 0:
-            entry_price = float(order.get("avgPrice") or price)
-        if not entry_exec_time:
-            entry_exec_time = self._iso_from_ms(order.get("updateTime") or order.get("time"))
-        return {
-            "direction": "long" if direction > 0 else "short",
-            "entry_order_id": entry_order_id,
-            "stop_order_id": stop_order_id,
-            "stop_order_kind": str(stop_order["order_kind"]),
-            "tp_order_id": tp_order_id,
-            "tp_order_kind": str(tp_order["order_kind"]),
-            "entry_price": entry_price,
-            "entry_fee": entry_fee,
-            "entry_exec_time": entry_exec_time or self._utc_now_iso(),
-            "size": qty,
-            "sl_price": stop_price,
-            "tp_price": tp_price,
-            "timestamp_entry": _utc_now().isoformat(),
-        }
+            self._live_state["exit_reason"] = "entry_cleanup"
+            self._persist_live_state()
+            detail = self._cleanup_failed_entry(exit_side)
+            raise OrderPlacementError(exc.leg, f"{exc.message}; {detail}") from exc
+        return self._live_state
 
     def _build_orders(
         self, direction: int, price: float, atr: float
@@ -1441,6 +1206,17 @@ class FuturesBot:
         return qty, stop_price, tp_price
 
     def run_once(self, cycle: int, timestamp: str, sleep_for: int | None = None) -> bool:
+        try:
+            return self._run_once(cycle, timestamp, sleep_for)
+        except (ClientError, requests.exceptions.RequestException, urllib3.exceptions.ProtocolError) as exc:
+            self._log_event("server_error", str(exc))
+            print(f"[error] cycle failed: {exc}")
+            return False
+        finally:
+            self._persist_live_state()
+            self._export_accounting()
+
+    def _run_once(self, cycle: int, timestamp: str, sleep_for: int | None = None) -> bool:
         self._process_live_exit()
         klines = self.fetch_klines()
         if klines.empty:
@@ -1515,90 +1291,56 @@ class FuturesBot:
             print(plan)
             print("[dry-run] pass --live to send orders")
             return False
+        if self.settings.live:
+            block = self.reconciler.entry_block_reason()
+            signal_key = "last_signal:" + self.settings.symbol + ":" + self.settings.interval
+            if block or self.ledger.setting(signal_key) == int(last.get("open_time", 0) or 0):
+                print(f"[accounting] skipping entry: {block or 'this candle already had an entry attempt'}")
+                return False
         self._ensure_leverage()
+        metadata = {
+            "side": signal_label,
+            "entry_signal_time": self._iso_from_ms(last.get("close_time", 0) or 0) or timestamp,
+            "entry_signal_open_time": int(last.get("open_time", 0) or 0),
+            "entry_reason": signal_reason,
+            "market_regime": regime,
+            "signal_open": float(last.get("open", float("nan"))),
+            "signal_high": float(last.get("high", float("nan"))),
+            "signal_low": float(last.get("low", float("nan"))),
+            "signal_close": float(last.get("close", float("nan"))),
+            "entry_price_expected": price,
+            "notional_usdt": round(price * qty, 8),
+            "leverage": self.settings.leverage,
+            "trailing_stop_price": "",
+            "ema_value": float(last.get("trend_ema", float("nan"))),
+            "atr_value": atr,
+            "adx_value": float(last.get("adx", float("nan"))),
+            "volume": float(last.get("volume", float("nan"))),
+            "volume_ma": float(last.get("volume_ma", float("nan"))),
+            "breakout_level": lower_band if direction > 0 else upper_band,
+            "zscore": zscore,
+            "max_unrealized_profit": 0.0,
+            "max_unrealized_loss": 0.0,
+            "max_favorable_excursion": 0.0,
+            "max_adverse_excursion": 0.0,
+            "signal_valid": 1,
+            "missed_trade": 0,
+            "wrong_trade": 0,
+            "exchange_error": 0,
+            "data_error": 0,
+            "server_error": 0,
+            "manual_intervention": 0,
+            "notes": "",
+            "bars_held": 0,
+            "peak_price": float(last.get("high", price) or price),
+            "trough_price": float(last.get("low", price) or price),
+        }
         try:
-            state = self._place_orders(direction, qty, stop_price, tp_price, slippage_price)
-            state.update(
-                {
-                    "trade_id": str(state["entry_order_id"]),
-                    "side": signal_label,
-                    "entry_signal_time": self._iso_from_ms(last.get("close_time", 0) or 0) or timestamp,
-                    "entry_signal_open_time": int(last.get("open_time", 0) or 0),
-                    "entry_reason": signal_reason,
-                    "market_regime": regime,
-                    "signal_open": float(last.get("open", float("nan"))),
-                    "signal_high": float(last.get("high", float("nan"))),
-                    "signal_low": float(last.get("low", float("nan"))),
-                    "signal_close": float(last.get("close", float("nan"))),
-                    "entry_price_expected": price,
-                    "notional_usdt": round(state["entry_price"] * qty, 8),
-                    "leverage": self.settings.leverage,
-                    "trailing_stop_price": "",
-                    "ema_value": float(last.get("trend_ema", float("nan"))),
-                    "atr_value": atr,
-                    "adx_value": float(last.get("adx", float("nan"))),
-                    "volume": float(last.get("volume", float("nan"))),
-                    "volume_ma": float(last.get("volume_ma", float("nan"))),
-                    "breakout_level": lower_band if direction > 0 else upper_band,
-                    "zscore": zscore,
-                    "max_unrealized_profit": 0.0,
-                    "max_unrealized_loss": 0.0,
-                    "max_favorable_excursion": 0.0,
-                    "max_adverse_excursion": 0.0,
-                    "signal_valid": 1,
-                    "missed_trade": 0,
-                    "wrong_trade": 0,
-                    "exchange_error": 0,
-                    "data_error": 0,
-                    "server_error": 0,
-                    "manual_intervention": 0,
-                    "notes": "",
-                    "bars_held": 0,
-                    "peak_price": float(last.get("high", price) or price),
-                    "trough_price": float(last.get("low", price) or price),
-                }
-            )
-            self._live_state = state
-            self._log_event(
-                "entry_signal",
-                signal_reason,
-                trade_id=state["trade_id"],
-                side=signal_label,
-                price=price,
-                event_time=state["entry_signal_time"],
-            )
-            self._log_event(
-                "entry_exec",
-                f"entry_order_id={state['entry_order_id']}",
-                trade_id=state["trade_id"],
-                side=signal_label,
-                price=state["entry_price"],
-                event_time=state["entry_exec_time"],
-            )
-            print(
-                f"[cycle] {cycle} @ {timestamp} "
-                f"signal={signal_label} price={price:.4f} atr={atr:.4f} "
-                f"mean={rolling_mean:.4f} zscore={zscore:.2f} regime={regime} "
-                f"sl={stop_price:.4f} tp={tp_price:.4f} qty={qty} "
-                f"entry_id={state['entry_order_id']} stop_id={state['stop_order_id']} "
-                f"tp_id={state['tp_order_id']} entry={state['entry_price']:.6f}"
-            )
+            state = self._place_orders(direction, qty, stop_price, tp_price, slippage_price, metadata)
+            print(f"[live] entry tracked trade_id={state['trade_id']} entry_order_id={state['entry_order_id']}")
         except OrderPlacementError as exc:
-            self._log_event(
-                "exchange_error",
-                str(exc),
-                side=signal_label,
-                price=price,
-            )
+            self._log_event("exchange_error", str(exc), side=signal_label, price=price)
             print(f"[error] {exc}")
-        except ClientError as exc:
-            self._log_event(
-                "exchange_error",
-                f"entry order failed: {self._client_error_message(exc)}",
-                side=signal_label,
-                price=price,
-            )
-            print(f"[error] order failed: {self._client_error_message(exc)}")
         return False
 
 
@@ -1783,8 +1525,8 @@ def parse_settings() -> Settings:
     parser.add_argument(
         "--trade-log",
         dest="trade_log",
-        default=os.getenv("BOT_TRADE_LOG", os.getenv("BOT_LIVE_LOG", "reports/trade_log.csv")),
-        help="CSV path for completed trade logs",
+        default=os.getenv("BOT_TRADE_LOG", os.getenv("BOT_LIVE_LOG", "reports/ledger_trades.csv")),
+        help="CSV report for open/closed trades and their accounting status",
     )
     parser.add_argument(
         "--live-log",
@@ -1793,7 +1535,7 @@ def parse_settings() -> Settings:
     )
     parser.add_argument(
         "--event-log",
-        default=os.getenv("BOT_EVENT_LOG", "reports/event_log.csv"),
+        default=os.getenv("BOT_EVENT_LOG", "reports/ledger_events.csv"),
         help="CSV path for entry/exit/error event logs",
     )
     parser.add_argument(
@@ -1805,13 +1547,13 @@ def parse_settings() -> Settings:
         "--trade-log-limit",
         type=int,
         default=int(os.getenv("BOT_TRADE_LOG_LIMIT", "1000")),
-        help="maximum number of rows to keep in trade_log.csv; 0 keeps all rows",
+        help="trade report row limit; 0 exports all rows, ledger history is never capped",
     )
     parser.add_argument(
         "--event-log-limit",
         type=int,
         default=int(os.getenv("BOT_EVENT_LOG_LIMIT", "1000")),
-        help="maximum number of rows to keep in event_log.csv; 0 keeps all rows",
+        help="event report row limit; 0 exports all rows, ledger history is never capped",
     )
     parser.add_argument(
         "--signal-diagnostics-limit",
@@ -1842,6 +1584,8 @@ def parse_settings() -> Settings:
         action="store_true",
         help="log one-line output when signal is FLAT",
     )
+    parser.add_argument("--ledger-path", default=os.getenv("BOT_LEDGER_PATH", "data/accounting/ledger.sqlite3"), help="Durable SQLite accounting ledger")
+    parser.add_argument("--account-id", default=os.getenv("BOT_ACCOUNT_ID", ""), help="Stable account label; default is a hash of the API key")
     args = parser.parse_args()
     if args.range_lookback < 2:
         raise SystemExit("--range-lookback must be at least 2.")
@@ -1923,6 +1667,8 @@ def parse_settings() -> Settings:
         live=args.live,
         loop=args.loop,
         poll_seconds=max(1, args.sleep),
+        ledger_path=args.ledger_path,
+        account_id=args.account_id,
         trade_log=args.trade_log,
         event_log=args.event_log,
         signal_diagnostics_log=args.signal_diagnostics_log,
@@ -1937,11 +1683,11 @@ def parse_settings() -> Settings:
 
 
 def main() -> None:
+    settings = parse_settings()
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
     if not api_key or not api_secret:
         raise RuntimeError("BINANCE_API_KEY/SECRET required in .env")
-    settings = parse_settings()
     try:
         bot = FuturesBot(settings=settings, api_key=api_key, api_secret=api_secret)
     except AuthPreflightError as exc:
@@ -1962,6 +1708,13 @@ def main() -> None:
                 time.sleep(sleep_for)
     except KeyboardInterrupt:
         print("\n[info] interrupted by user; exiting")
+    finally:
+        try:
+            bot._persist_live_state()
+            bot._export_accounting()
+        finally:
+            if bot.ledger:
+                bot.ledger.close()
 
 
 if __name__ == "__main__":
